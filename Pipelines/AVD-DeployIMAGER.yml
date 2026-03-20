@@ -1,0 +1,676 @@
+trigger:
+- none
+
+pool:
+  name: ${{ parameters.agentPool }}
+
+parameters:
+  - name: agentPool
+    type: string
+    default: '<AGENT_POOL_NAME>'
+    displayName: "Agent pool name"
+
+  - name: serviceConnection
+    type: string
+    default: '<SERVICE_CONNECTION_NAME>'
+    displayName: "Azure DevOps service connection name"
+
+  - name: approvalEnvironment
+    type: string
+    default: '<APPROVAL_ENVIRONMENT_NAME>'
+    displayName: "Azure DevOps approval environment name"
+
+  - name: jsonFilePath
+    type: string
+    default: 'Environments/Hostpools/hostpool.template.json'
+    displayName: "Path to JSON configuration file (copy and customize from hostpool.template.json)"
+
+  - name: ImageID
+    type: string
+    displayName: "The image ID Resource ID to be used"   
+    default: "/subscriptions/<SUBSCRIPTION_ID_IMAGES_PRD>/resourcegroups/rg-avd-images-prd-image-weu-001/providers/microsoft.compute/galleries/galavdimagesprdweu001/images/imgd-avd-images-prd-win/versions/1.0.1"
+
+  - name: VirtualMachineName
+    type: string
+    displayName: "The name prefix for the VMs"   
+    default: "avd-prd-vm"
+
+  - name: imageType
+    type: string
+    default: 'standard'
+    displayName: "Image type (standard or cvm/confidential compute)"
+    values:
+      - standard
+      - cvm
+
+  - name: deploymentIdentifier
+    type: string
+    default: "deployment"
+    displayName: "Unique deployment identifier"
+
+stages:
+  - stage: approvalGate_${{ parameters.deploymentIdentifier }}
+    displayName: 'Approval Gate'
+    jobs:
+      - deployment: hostsDeployment
+        displayName: "Approval Gate for Deployment"
+        environment: ${{ parameters.approvalEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+  - stage: InitializeParameters_${{ parameters.deploymentIdentifier }}
+    displayName: 'Initialize Parameters'
+    condition: succeeded('approvalGate_${{ parameters.deploymentIdentifier }}')
+    jobs:
+      - job: LoadParameters
+        displayName: 'Load and Validate Parameters'
+        steps:
+          - task: PowerShell@2
+            displayName: "Load parameters from JSON file"
+            inputs:
+              targetType: "inline"
+              script: |
+                try {
+                  $jsonFilePath = "$env:jsonFilePath"
+                  Write-Host "##[section]Loading JSON Configuration"
+                  Write-Host "JSON File: '$jsonFilePath'"
+
+                  if ([string]::IsNullOrEmpty($jsonFilePath)) {
+                      Write-Host "##vso[task.logissue type=error]Parameter 'jsonFilePath' is required but was not provided."
+                      exit 1
+                  } elseif (Test-Path $jsonFilePath) {
+                    $jsonParams = Get-Content $jsonFilePath | ConvertFrom-Json
+                    Write-Host "##[section]JSON file loaded successfully"
+                    
+                    # Validate required parameters exist in JSON
+                    $requiredParams = @("location","subscriptionName", "hostPoolName", "hostPoolResourceGroup", 
+                                      "vmSize", "vmNamePrefix", "subnetId", "domainJoinKeyVaultID", 
+                                      "keyVaultName", "automationAccountName", "automationResourceGroup",
+                                      "logAnalyticsWorkspaceId", "hostsResourceGroup")
+                    
+                    $missingParams = @()
+                    foreach ($param in $requiredParams) {
+                      if (-not (Get-Member -InputObject $jsonParams -Name $param -MemberType Properties)) {
+                        $missingParams += $param
+                      }
+                    }
+                    
+                    if ($missingParams.Count -gt 0) {
+                      Write-Host "##vso[task.logissue type=error]Missing required parameters in JSON file:"
+                      foreach ($param in $missingParams) {
+                        Write-Host "##vso[task.logissue type=error]  - $param"
+                      }
+                      exit 1
+                    }
+                    
+                    # Set variables based on JSON content
+                    Write-Host "##[section]Setting pipeline variables..."
+                    Write-Host "##vso[task.setvariable variable=subscriptionname;isOutput=true]$($jsonParams.subscriptionName)"
+                    Write-Host "##vso[task.setvariable variable=location;isOutput=true]$($jsonParams.location)"
+                    
+                    # Use vmLocation for session hosts if specified, otherwise fall back to location
+                    $vmLocation = if ($jsonParams.vmLocation) { $jsonParams.vmLocation } else { $jsonParams.location }
+                    Write-Host "##vso[task.setvariable variable=vmLocation;isOutput=true]$vmLocation"
+                    Write-Host "VM Location for Session Hosts: $vmLocation"
+                    
+                    Write-Host "##vso[task.setvariable variable=hostpoolname;isOutput=true]$($jsonParams.hostPoolName)"
+                    Write-Host "##vso[task.setvariable variable=hostpoolresourcegroup;isOutput=true]$($jsonParams.hostPoolResourceGroup)"
+                    
+                    # Use hostsResourceGroup for VMs if specified, otherwise fall back to hostPoolResourceGroup
+                    $hostsRg = if ($jsonParams.hostsResourceGroup) { $jsonParams.hostsResourceGroup } else { $jsonParams.hostPoolResourceGroup }
+                    Write-Host "##vso[task.setvariable variable=hostsresourcegroup;isOutput=true]$hostsRg"
+                    Write-Host "Hosts Resource Group (VMs): $hostsRg"
+                    
+                    Write-Host "##vso[task.setvariable variable=vmSize;isOutput=true]$($jsonParams.vmSize)"
+                    Write-Host "##vso[task.setvariable variable=vmNamePrefix;isOutput=true]$($jsonParams.vmNamePrefix)"
+                    Write-Host "##vso[task.setvariable variable=subnetId;isOutput=true]$($jsonParams.subnetId)"
+                    Write-Host "##vso[task.setvariable variable=DomainJoinKeyVaultID;isOutput=true]$($jsonParams.domainJoinKeyVaultID)"
+                    Write-Host "##vso[task.setvariable variable=keyvaultname;isOutput=true]$($jsonParams.keyVaultName)"
+                    Write-Host "##vso[task.setvariable variable=LogAnalyticsWorkspaceId;isOutput=true]$($jsonParams.logAnalyticsWorkspaceId)"
+                    Write-Host "##vso[task.setvariable variable=automationaccountname;isOutput=true]$($jsonParams.automationAccountName)"
+                    Write-Host "##vso[task.setvariable variable=automationresourcegroup;isOutput=true]$($jsonParams.automationResourceGroup)"
+                    
+                    # Set the pipeline parameters as variables
+                    Write-Host "##vso[task.setvariable variable=SharedImageId;isOutput=true]${{ parameters.ImageID }}"
+                    Write-Host "##vso[task.setvariable variable=VirtualMachineName;isOutput=true]${{ parameters.VirtualMachineName }}"
+                    Write-Host "##vso[task.setvariable variable=imageType;isOutput=true]${{ parameters.imageType }}"
+
+                    # Set CVM/Confidential Compute parameters if applicable
+                    $imageType = "${{ parameters.imageType }}"
+                    if ($imageType -eq 'cvm') {
+                      Write-Host "##[section]Confidential Compute mode enabled"
+
+                      # Validate CC-specific parameters exist in JSON
+                      $ccParams = @("diskEncryptionSetName", "managedHsmName")
+                      $missingCcParams = @()
+                      foreach ($p in $ccParams) {
+                        $val = $jsonParams.$p
+                        if (-not $val -or $val -eq 'notinuse' -or [string]::IsNullOrWhiteSpace($val)) {
+                          $missingCcParams += $p
+                        }
+                      }
+                      if ($missingCcParams.Count -gt 0) {
+                        Write-Host "##vso[task.logissue type=error]CVM mode requires the following JSON parameters to be set (not 'notinuse'):"
+                        foreach ($p in $missingCcParams) {
+                          Write-Host "##vso[task.logissue type=error]  - $p"
+                        }
+                        exit 1
+                      }
+
+                      Write-Host "##vso[task.setvariable variable=diskEncryptionSetName;isOutput=true]$($jsonParams.diskEncryptionSetName)"
+
+                      # Use vmSizeCC from JSON if available, otherwise fall back to vmSize
+                      $vmSizeCC = if ($jsonParams.vmSizeCC -and $jsonParams.vmSizeCC -ne 'notinuse') { $jsonParams.vmSizeCC } else { $jsonParams.vmSize }
+                      Write-Host "##vso[task.setvariable variable=vmSize;isOutput=true]$vmSizeCC"
+                      Write-Host "CVM VM Size: $vmSizeCC"
+                    } else {
+                      Write-Host "##vso[task.setvariable variable=diskEncryptionSetName;isOutput=true]"
+                    }
+                    
+                    Write-Host "##[section]✅ Parameters loaded successfully"
+                  } else {
+                    Write-Host "##vso[task.logissue type=error]JSON file not found at '$jsonFilePath'."
+                    exit 1
+                  }
+                } catch {
+                  Write-Host "##vso[task.logissue type=error]Error reading JSON file: $($_.Exception.Message)"
+                  exit 1
+                }
+            env:
+              jsonFilePath: ${{ parameters.jsonFilePath }}
+            name: setVariables
+
+          - task: PowerShell@2
+            displayName: "Display loaded variables"
+            inputs:
+              targetType: "inline"
+              script: |
+                Write-Host "##[section]=============== LOADED VARIABLES ==============="
+                
+                $subscriptionname = $env:SUBSCRIPTION_NAME
+                $location = $env:LOCATION
+                $hostpoolname = $env:HOSTPOOL_NAME
+                $hostpoolresourcegroup = $env:HOSTPOOL_RG
+                $vmSize = $env:VM_SIZE
+                $vmNamePrefix = $env:VM_PREFIX
+                $VirtualMachineName = $env:VIRTUALMACHINENAME
+                $SharedImageId = $env:SHAREDIMAGEID
+                
+                Write-Host "Subscription Name: $subscriptionname"
+                Write-Host "Location: $location"
+                Write-Host "Hostpool Name: $hostpoolname"
+                Write-Host "Hostpool Resource Group: $hostpoolresourcegroup"
+                Write-Host "Hosts Resource Group (VMs): $env:HOSTS_RG"
+                Write-Host "VM size: $vmSize"
+                Write-Host "VM name prefix (from JSON): $vmNamePrefix"
+                Write-Host "VM name (pipeline parameter): $VirtualMachineName"
+                Write-Host "Shared Image ID: $SharedImageId"
+                Write-Host "Image Type: $env:IMAGE_TYPE"
+                Write-Host "Disk Encryption Set Name: $env:DES_NAME"
+                Write-Host "Build ID: $env:BUILD_BUILDID"
+                Write-Host "Build Number: $env:BUILD_BUILDNUMBER"
+                Write-Host "Requested By: $env:BUILD_REQUESTEDFOR"
+                Write-Host "================================================"
+            env:
+              SUBSCRIPTION_NAME: $(setVariables.subscriptionname)
+              LOCATION: $(setVariables.location)
+              HOSTPOOL_NAME: $(setVariables.hostpoolname)
+              HOSTPOOL_RG: $(setVariables.hostpoolresourcegroup)
+              HOSTS_RG: $(setVariables.hostsresourcegroup)
+              VM_SIZE: $(setVariables.vmSize)
+              VM_PREFIX: $(setVariables.vmNamePrefix)
+              VIRTUALMACHINENAME: $(setVariables.VirtualMachineName)
+              SHAREDIMAGEID: $(setVariables.SharedImageId)
+              IMAGE_TYPE: $(setVariables.imageType)
+              DES_NAME: $(setVariables.diskEncryptionSetName)
+              BUILD_BUILDID: $(Build.BuildId)
+              BUILD_BUILDNUMBER: $(Build.BuildNumber)
+              BUILD_REQUESTEDFOR: $(Build.RequestedFor)
+
+
+  - stage: RetrieveExistingResources_${{ parameters.deploymentIdentifier }}
+    displayName: "Retrieve Existing AVD Resources"
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      hostpoolname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolname'] ]
+      hostpoolresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolresourcegroup'] ]
+      keyvaultname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.keyvaultname'] ]
+      imageType: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.imageType'] ]
+      diskEncryptionSetName: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.diskEncryptionSetName'] ]
+    jobs:
+      - job: RetrieveResources
+        displayName: 'Retrieve Resources'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Retrieve Existing Resources"
+            name: existingResources
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Set error action preference to continue on warnings
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                
+                # Suppress Azure CLI warnings
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+                
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "##[section]Retrieving Host Pool Information"
+                
+                # Get the actual subscription ID (not the name)
+                $subscriptionId = az account show --query "id" -o tsv 2>$null
+                Write-Host "Subscription ID: $subscriptionId"
+                
+                # Get Host Pool ID
+                $apiVersion = "2023-09-05"
+                $hostPoolUri = "https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/$(hostpoolresourcegroup)/providers/Microsoft.DesktopVirtualization/hostPools/$(hostpoolname)?api-version=${apiVersion}"
+                
+                $hostPoolResult = az rest --method GET --uri "$hostPoolUri" 2>$null
+                if ($LASTEXITCODE -eq 0) {
+                    $hostPoolData = $hostPoolResult | ConvertFrom-Json
+                    $hostPool = $hostPoolData.id
+                    Write-Host "✅ Host Pool ID: $hostPool"
+                    Write-Host "##vso[task.setvariable variable=hostPoolId;isOutput=true]$hostPool"
+                } else {
+                    Write-Host "##vso[task.logissue type=error]Host Pool '$(hostpoolname)' not found."
+                    exit 1
+                }
+                
+                Write-Host "##[section]Retrieving KeyVault Information"
+                # Get KeyVault ID
+                $keyVaultOutput = az keyvault show `
+                  --name "$(keyvaultname)" `
+                  --query "id" -o tsv 2>&1
+                
+                $keyVault = $keyVaultOutput | Where-Object { $_ -notmatch "WARNING:" -and $_ -ne "" } | Select-Object -First 1
+                
+                if ([string]::IsNullOrEmpty($keyVault)) {
+                  Write-Host "##vso[task.logissue type=error]KeyVault '$(keyvaultname)' not found."
+                  exit 1
+                }
+                
+                Write-Host "✅ KeyVault ID: $keyVault"
+                Write-Host "##vso[task.setvariable variable=keyVaultId;isOutput=true]$keyVault"
+                
+                # Get KeyVault Resource Group
+                if ($keyVault -match "/resourceGroups/([^/]+)/") {
+                  $kvResourceGroup = $matches[1]
+                  Write-Host "✅ KeyVault Resource Group: $kvResourceGroup"
+                  Write-Host "##vso[task.setvariable variable=kvResourceGroup;isOutput=true]$kvResourceGroup"
+                }
+                
+                Write-Host "##[section]Retrieving Managed Identity"
+                # Get Managed Identity ID (Key Vault UAMI, NOT the CC UAMI)
+                # Exclude CC UAMIs (uami-cc-*) which are used for Disk Encryption Sets
+                $managedIdentitiesJson = az identity list `
+                  --resource-group "$kvResourceGroup" `
+                  --query "[?contains(name, 'uami-') && !contains(name, 'uami-cc-')]" 2>&1
+                
+                $managedIdentitiesJson = $managedIdentitiesJson | Where-Object { $_ -notmatch "WARNING:" } | Out-String
+                
+                if (-not [string]::IsNullOrWhiteSpace($managedIdentitiesJson)) {
+                  $managedIdentities = $managedIdentitiesJson | ConvertFrom-Json
+                  
+                  if ($managedIdentities -and $managedIdentities.Count -gt 0) {
+                    $managedIdentityId = $managedIdentities[0].id
+                    Write-Host "✅ Managed Identity ID: $managedIdentityId"
+                    Write-Host "##vso[task.setvariable variable=managedIdentityId;isOutput=true]$managedIdentityId"
+                  } else {
+                    Write-Host "##vso[task.logissue type=error]No managed identity found in resource group '$kvResourceGroup'."
+                    exit 1
+                  }
+                } else {
+                  Write-Host "##vso[task.logissue type=error]No managed identity found in resource group '$kvResourceGroup'."
+                  exit 1
+                }
+                
+                # Retrieve Disk Encryption Set ID if CVM mode is enabled
+                $imageType = "$(imageType)"
+                $desName = "$(diskEncryptionSetName)"
+                if ($imageType -eq 'cvm' -and -not [string]::IsNullOrWhiteSpace($desName) -and $desName -ne 'notinuse') {
+                  Write-Host "##[section]Retrieving Disk Encryption Set for Confidential Compute"
+                  Write-Host "DES Name: $desName"
+
+                  # Search for the DES across resource groups in the subscription
+                  $desId = az disk-encryption-set show `
+                    --name "$desName" `
+                    --resource-group "$kvResourceGroup" `
+                    --query "id" -o tsv 2>$null
+
+                  if ([string]::IsNullOrWhiteSpace($desId)) {
+                    # Fallback: search all resource groups
+                    $desId = az disk-encryption-set list `
+                      --query "[?name=='$desName'].id | [0]" -o tsv 2>$null
+                  }
+
+                  if ([string]::IsNullOrWhiteSpace($desId)) {
+                    Write-Host "##vso[task.logissue type=error]Disk Encryption Set '$desName' not found. CVM deployment requires a valid DES."
+                    exit 1
+                  }
+
+                  Write-Host "✅ Disk Encryption Set ID: $desId"
+                  Write-Host "##vso[task.setvariable variable=diskEncryptionSetId;isOutput=true]$desId"
+                } else {
+                  Write-Host "##vso[task.setvariable variable=diskEncryptionSetId;isOutput=true]"
+                }
+
+                Write-Host "##[section]✅ Resource retrieval completed successfully"
+
+  - stage: DeployNewSessionHosts_${{ parameters.deploymentIdentifier }}
+    displayName: "Deploy New Session Hosts"
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - RetrieveExistingResources_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      location: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.location'] ]
+      vmLocation: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.vmLocation'] ]
+      hostpoolname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolname'] ]
+      hostpoolresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolresourcegroup'] ]
+      hostsresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostsresourcegroup'] ]
+      vmSize: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.vmSize'] ]
+      subnetId: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subnetId'] ]
+      DomainJoinKeyVaultID: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.DomainJoinKeyVaultID'] ]
+      hostPoolId: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.hostPoolId'] ]
+      keyVaultId: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.keyVaultId'] ]
+      managedIdentityId: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.managedIdentityId'] ]
+      SharedImageId: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.SharedImageId'] ]
+      VirtualMachineName: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.VirtualMachineName'] ]
+      imageType: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.imageType'] ]
+      diskEncryptionSetId: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.diskEncryptionSetId'] ]
+
+    jobs:
+      - job: Deploy
+        displayName: 'Deploy VMs'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Ensure Hosts Resource Group Exists"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription $(subscriptionname)
+
+                Write-Host "##[section]Ensuring Resource Group '$(hostsresourcegroup)' exists"
+
+                # Check if resource group exists and get its location
+                $existingRg = az group show --name "$(hostsresourcegroup)" --query "location" -o tsv 2>$null
+                if ($existingRg) {
+                  Write-Host "✅ Resource group '$(hostsresourcegroup)' already exists in location: $existingRg"
+                  $rgLocation = $existingRg
+                } else {
+                  Write-Host "Resource group '$(hostsresourcegroup)' does not exist, will create in location: $(vmLocation)"
+                  $rgLocation = "$(vmLocation)"
+                }
+
+                # Deploy/ensure the Resource Group via Bicep subscription-level deployment
+                $templateFile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/ResourceGroup/module.bicep"
+                $parameterFile = "$(System.DefaultWorkingDirectory)/Environments/$(subscriptionname)/$(hostpoolname)/ResourceGroups/Hosts/main.parameters.json"
+
+                if (-not (Test-Path $templateFile)) {
+                  Write-Host "##vso[task.logissue type=error]Template file '$templateFile' not found."
+                  exit 1
+                }
+                if (-not (Test-Path $parameterFile)) {
+                  Write-Host "##vso[task.logissue type=error]Parameter file '$parameterFile' not found."
+                  exit 1
+                }
+
+                Write-Host "Deploying Resource Group using Bicep in location: $rgLocation"
+                $output = az deployment sub create `
+                  --location $rgLocation `
+                  --name "Deploy-$(subscriptionname)-HostsRG-$(Build.BuildId)" `
+                  --template-file $templateFile `
+                  --parameters "$parameterFile" `
+                  --parameters resourceGroupName="$(hostsresourcegroup)" location="$rgLocation"
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to create resource group '$(hostsresourcegroup)'"
+                  exit 1
+                }
+
+                $resourceGroupName = ($output | ConvertFrom-Json).properties.outputs.resourceGroupName.value
+                Write-Host "##[section]✅ Resource Group ready: $resourceGroupName"
+
+          - task: AzureCLI@2
+            displayName: "Generate Host Pool Registration Token"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+                
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "##[section]Generating registration token for host pool: $(hostpoolname)"
+                
+                # Calculate expiration time (24 hours from now)
+                $expirationTime = (Get-Date).AddHours(24).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                
+                Write-Host "Token expiration time: $expirationTime"
+                
+                # Update the host pool with a new registration token using REST API
+                Write-Host "Generating new registration token using REST API..."
+                
+                $subscriptionId = az account show --query "id" -o tsv 2>$null
+                if (-not $subscriptionId) {
+                    $subscriptionId = "$(subscriptionname)"
+                }
+                
+                $apiVersion = "2023-09-05"
+                $hostPoolUri = "https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/$(hostpoolresourcegroup)/providers/Microsoft.DesktopVirtualization/hostPools/$(hostpoolname)?api-version=${apiVersion}"
+                
+                $body = @{
+                    properties = @{
+                        registrationInfo = @{
+                            expirationTime = $expirationTime
+                            registrationTokenOperation = "Update"
+                        }
+                    }
+                } | ConvertTo-Json -Depth 10
+                
+                $tempBodyFile = [System.IO.Path]::GetTempFileName()
+                $body | Out-File -FilePath $tempBodyFile -Encoding UTF8
+                
+                $null = az rest --method PATCH --uri "$hostPoolUri" --body "@$tempBodyFile" 2>$null
+                
+                Remove-Item $tempBodyFile -Force -ErrorAction SilentlyContinue
+                
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to generate registration token"
+                  exit 1
+                } else {
+                  Write-Host "Successfully generated new registration token"
+                }
+                
+                # Wait a moment for the token to be ready
+                Start-Sleep -Seconds 5
+                
+          - task: AzureCLI@2
+            displayName: "Deploy New Session Hosts"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "##[section]Deploying Session Hosts"
+                Write-Host "Host Pool: $(hostpoolname)"
+                Write-Host "VM Name: $(VirtualMachineName)"
+                Write-Host "VM Size: $(vmSize)"
+                Write-Host "Shared Image ID: $(SharedImageId)"
+                Write-Host "Image Type: $(imageType)"
+                
+                # Select the correct template based on image type
+                $imageType = "$(imageType)"
+                if ($imageType -eq 'cvm') {
+                  Write-Host "##[section]Using Confidential Compute imager template"
+                  $templatefile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/AzureVirtualDesktop/SessionHost/imager-cc.bicep"
+                  $parameterfile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/AzureVirtualDesktop/SessionHost/imager-cc.parameters.json"
+                } else {
+                  Write-Host "##[section]Using standard imager template"
+                  $templatefile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/AzureVirtualDesktop/SessionHost/imager.bicep"
+                  $parameterfile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/AzureVirtualDesktop/SessionHost/imager.parameters.json"
+                }
+                
+                if (-not (Test-Path $templatefile)) {
+                  Write-Host "##vso[task.logissue type=error]Template file '$templatefile' not found."
+                  exit 1
+                }
+                
+                if (-not (Test-Path $parameterfile)) {
+                  Write-Host "##vso[task.logissue type=error]Parameter file not found at: $parameterfile"
+                  Write-Host "This file is required as it contains KeyVault secret names and other deployment settings."
+                  exit 1
+                }
+                
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                
+                # Get timestamp for tags
+                $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                $deploymentId = "$(Build.BuildId)"
+                
+                Write-Host "Reading parameters from existing file..."
+                $existingParams = Get-Content $parameterfile -Raw | ConvertFrom-Json
+                
+                # Build deployment parameters
+                $deploymentParams = @{}
+                
+                # Copy ALL parameters from the existing file
+                foreach ($param in $existingParams.parameters.PSObject.Properties) {
+                  $paramName = $param.Name
+                  $paramValue = $param.Value.value
+                  $deploymentParams[$paramName] = $paramValue
+                }
+                
+                # Override specific parameters
+                $deploymentParams["vmSize"] = "$(vmSize)"
+                $deploymentParams["vmNamePrefix"] = "$(VirtualMachineName)"
+                $deploymentParams["subnetId"] = "$(subnetId)"
+                $deploymentParams["LocalKeyVaultId"] = "$(keyVaultId)"
+                $deploymentParams["SharedImageId"] = "$(SharedImageId)"
+                $deploymentParams["userAssignedIdentityId"] = "$(managedIdentityId)"
+                
+                # Override CVM-specific parameters when in confidential compute mode
+                if ($imageType -eq 'cvm') {
+                  $desId = "$(diskEncryptionSetId)"
+                  if ([string]::IsNullOrWhiteSpace($desId)) {
+                    Write-Host "##vso[task.logissue type=error]CVM mode requires a Disk Encryption Set ID but none was retrieved."
+                    exit 1
+                  }
+                  $deploymentParams["diskEncryptionSetId"] = $desId
+                  Write-Host "CVM: Disk Encryption Set ID: $desId"
+                }
+                
+                # Handle tags
+                if ($deploymentParams.ContainsKey('tags') -and $deploymentParams['tags'] -ne $null) {
+                  $tags = $deploymentParams['tags']
+                  if ($tags -is [PSObject]) {
+                    $newTags = @{}
+                    $tags.PSObject.Properties | ForEach-Object {
+                      $newTags[$_.Name] = $_.Value
+                    }
+                    $tags = $newTags
+                  }
+                } else {
+                  $tags = @{}
+                }
+                
+                # Add deployment metadata to tags
+                $tags["DeploymentTime"] = $timestamp
+                $tags["DeploymentId"] = $deploymentId
+                $tags["BuildNumber"] = "$(Build.BuildNumber)"
+                $tags["RequestedBy"] = "$(Build.RequestedFor)"
+                $deploymentParams["tags"] = $tags
+                
+                # Override location with vmLocation for session hosts
+                $deploymentParams["location"] = "$(vmLocation)"
+                
+                Write-Host ""
+                Write-Host "##[section]DEPLOYMENT CONFIGURATION"
+                Write-Host "Subscription: $(subscriptionname)"
+                Write-Host "Host Pool Resource Group: $(hostpoolresourcegroup)"
+                Write-Host "Hosts Resource Group (VMs): $(hostsresourcegroup)"
+                Write-Host "Location (general): $(location)"
+                Write-Host "VM Location (session hosts): $(vmLocation)"
+                Write-Host "VM Name: $(VirtualMachineName)"
+                Write-Host "Image Type: $imageType"
+                Write-Host "Template: $templatefile"
+                Write-Host "Parameters: $parameterfile"
+                if ($imageType -eq 'cvm') {
+                  Write-Host "Disk Encryption Set ID: $(diskEncryptionSetId)"
+                }
+                Write-Host ""
+                
+                # Create temporary parameter file
+                $tempParamFile = Join-Path $env:TEMP "session-hosts-params-$(New-Guid).json"
+                $paramFileContent = @{
+                  "`$schema" = "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#"
+                  "contentVersion" = "1.0.0.0"
+                  "parameters" = @{}
+                }
+                
+                foreach ($key in $deploymentParams.Keys) {
+                  $paramFileContent.parameters[$key] = @{ "value" = $deploymentParams[$key] }
+                }
+                
+                $paramFileContent | ConvertTo-Json -Depth 10 | Out-File -FilePath $tempParamFile -Encoding UTF8
+                
+                try {
+                  Write-Host ""
+                  Write-Host "##[section]Starting deployment..."
+                  $deploymentName = "Deploy-SessionHosts-$(hostpoolname)-$(Build.BuildId)"
+
+                  # Run what-if deployment
+                  az deployment group what-if `
+                    --resource-group "$(hostsresourcegroup)" `
+                    --name $deploymentName `
+                    --template-file "$templatefile" `
+                    --parameters "$tempParamFile" `
+                    --debug `
+                    --no-prompt true
+
+                  # Run deployment
+                  az deployment group create `
+                    --resource-group "$(hostsresourcegroup)" `
+                    --name $deploymentName `
+                    --template-file "$templatefile" `
+                    --parameters "$tempParamFile" `
+                    --mode Incremental `
+                    --debug `
+                    --no-prompt true
+                  
+                  if ($LASTEXITCODE -ne 0) {
+                    Write-Host "##vso[task.logissue type=error]Failed to deploy session hosts"
+                    exit 1
+                  } else {
+                    Write-Host ""
+                    Write-Host "##[section]✅ Successfully deployed session hosts!"
+                  }
+                } finally {
+                  # Clean up temp file
+                  if (Test-Path $tempParamFile) {
+                    Remove-Item $tempParamFile -Force
+                  }
+                }

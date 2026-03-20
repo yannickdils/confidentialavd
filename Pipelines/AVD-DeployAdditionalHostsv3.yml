@@ -1,0 +1,2818 @@
+trigger:
+- none
+
+pool:
+  name: ${{ parameters.agentPool }}
+
+parameters:
+  - name: agentPool
+    type: string
+    default: '<AGENT_POOL_NAME>'
+    displayName: "Agent pool name"
+
+  - name: serviceConnection
+    type: string
+    default: '<SERVICE_CONNECTION_NAME>'
+    displayName: "Azure DevOps service connection name"
+
+  - name: approvalEnvironment
+    type: string
+    default: '<APPROVAL_ENVIRONMENT_NAME>'
+    displayName: "Azure DevOps approval environment name"
+
+  - name: jsonFilePath
+    type: string
+    default: 'Environments/Hostpools/hostpool.template.json'
+    displayName: "Path to JSON configuration file (copy and customize from hostpool.template.json)"
+
+  - name: DeploymentActivation
+    type: string
+    default: 'A'
+    displayName: "A or B deployment activation"
+    values:
+    - A
+    - B
+
+  - name: operationType
+    type: string
+    default: 'add'
+    displayName: "Operation type: add new hosts or replace existing hosts"
+    values:
+    - add
+    - replace
+
+  - name: confidentialCompute
+    type: boolean
+    default: false
+    displayName: "Enable Confidential Compute for session hosts"
+
+  - name: customerManagedKeys
+    type: boolean
+    default: false
+    displayName: "Use Customer-Managed Keys (CMK) - requires Managed HSM. When false with CC enabled, uses Platform-Managed Keys (PMK)."
+
+  - name: domainJoinType
+    type: string
+    default: 'fromConfig'
+    displayName: "Domain join type (fromConfig = use JSON config value)"
+    values:
+    - fromConfig
+    - AD
+    - EntraID
+
+  - name: keyUrl
+    type: string
+    default: 'none'
+    displayName: "Managed HSM Key URL (only required when Confidential Compute + Customer-Managed Keys is enabled)"
+
+  - name: ImageID
+    type: string
+    displayName: "The image ID Resource ID to be used (leave empty or 'none' for marketplace image from JSON config)"   
+    default: "none"
+
+  - name: deploymentIdentifier
+    type: string
+    default: "deployment"
+    displayName: "Unique deployment identifier"
+
+  # Parameters for adding hosts
+  - name: startingHostNumber
+    type: number
+    default: 1
+    displayName: "Starting host number (for add operation)"
+
+  - name: additionalHostCount
+    type: number
+    default: 1
+    displayName: "Number of hosts to add/replace"
+
+  # Parameters for replacing hosts
+  - name: hostsToReplace
+    type: string
+    default: "none"
+    displayName: "Comma-separated list of host names to replace (leave empty or 'none' to replace all)"
+
+  - name: userWarningMessage
+    type: string
+    default: "System maintenance will begin in {minutes} minutes. Please save your work and log off."
+    displayName: "Warning message to send to users (use {minutes} as placeholder for time)"
+
+  - name: warningDelayMinutes
+    type: number
+    default: 30
+    displayName: "Minutes to wait after sending warning before force logoff"
+
+  - name: cleanupDelayDays
+    type: number
+    default: 2
+    displayName: "Days to wait before deleting old hosts (1-7 days)"
+    values:
+    - 1
+    - 2
+    - 3
+    - 7
+
+variables:
+  - name: isReplaceOperation
+    value: ${{ eq(parameters.operationType, 'replace') }}
+  - name: isConfidentialCompute
+    value: ${{ eq(parameters.confidentialCompute, true) }}
+  - name: isCustomerManagedKeys
+    value: ${{ and(eq(parameters.confidentialCompute, true), eq(parameters.customerManagedKeys, true)) }}
+
+stages:
+  - stage: approvalGate_${{ parameters.deploymentIdentifier }}
+    displayName: 'Approval Gate'
+    jobs:
+      - deployment: hostsDeployment
+        displayName: "Approval Gate for ${{ parameters.operationType }} Hosts"
+        environment: ${{ parameters.approvalEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+  - stage: ValidateConfidentialCompute_${{ parameters.deploymentIdentifier }}
+    displayName: 'Validate Confidential Compute Parameters'
+    condition: and(succeeded('approvalGate_${{ parameters.deploymentIdentifier }}'), eq('${{ parameters.confidentialCompute }}', 'true'))
+    dependsOn:
+      - approvalGate_${{ parameters.deploymentIdentifier }}
+    jobs:
+      - job: Validate
+        displayName: 'Validate CC Parameters'
+        steps:
+          - task: PowerShell@2
+            displayName: "Validate Confidential Compute Parameters in JSON"
+            inputs:
+              targetType: "inline"
+              script: |
+                Write-Host "##[section]Validating Confidential Compute Parameters from JSON config"
+
+                $jsonFilePath = "$env:jsonFilePath"
+                if (-not (Test-Path $jsonFilePath)) {
+                  Write-Host "##vso[task.logissue type=error]JSON file not found at '$jsonFilePath'."
+                  exit 1
+                }
+
+                $jsonParams = Get-Content $jsonFilePath | ConvertFrom-Json
+                $valid = $true
+                $isCustomerManagedKeys = "${{ parameters.customerManagedKeys }}" -eq "True"
+
+                Write-Host "Confidential Compute: Enabled"
+                Write-Host "Customer-Managed Keys (CMK): $isCustomerManagedKeys"
+
+                if ($isCustomerManagedKeys) {
+                  Write-Host ""
+                  Write-Host "##[section]Validating CMK-specific parameters..."
+
+                  # Validate diskEncryptionSetName
+                  $desName = $jsonParams.diskEncryptionSetName
+                  if ([string]::IsNullOrEmpty($desName) -or $desName -eq 'notinuse') {
+                    Write-Host "##vso[task.logissue type=error]'diskEncryptionSetName' is missing or set to 'notinuse' in the JSON config. Required for Customer-Managed Keys."
+                    $valid = $false
+                  } else {
+                    Write-Host "✅ Disk Encryption Set Name: $desName"
+                  }
+
+                  # Validate keyVaultResourceGroup (used as the RG where DES lives)
+                  $kvRg = $jsonParams.keyVaultResourceGroup
+                  if (-not $kvRg) { $kvRg = $jsonParams.keyvaultresourcegroup }
+                  if ([string]::IsNullOrEmpty($kvRg)) {
+                    Write-Host "##vso[task.logissue type=error]'keyVaultResourceGroup' is missing in the JSON config. It is needed to locate the Disk Encryption Set."
+                    $valid = $false
+                  } else {
+                    Write-Host "✅ Key Vault Resource Group (DES location): $kvRg"
+                  }
+
+                  # Validate keyUrl - use pipeline parameter if provided, otherwise fall back to JSON config
+                  $keyUrlParam = "${{ parameters.keyUrl }}"
+                  if ($keyUrlParam -eq 'none') { $keyUrlParam = '' }
+                  $keyUrlJson = $jsonParams.managedHsmKeyUrl
+                  
+                  if (-not [string]::IsNullOrEmpty($keyUrlParam)) {
+                    $keyUrl = $keyUrlParam
+                    Write-Host "Using keyUrl from pipeline parameter (override)"
+                  } elseif (-not [string]::IsNullOrEmpty($keyUrlJson)) {
+                    $keyUrl = $keyUrlJson
+                    Write-Host "Using keyUrl from JSON config (managedHsmKeyUrl)"
+                  } else {
+                    $keyUrl = ""
+                  }
+
+                  if ([string]::IsNullOrEmpty($keyUrl)) {
+                    Write-Host "##vso[task.logissue type=error]'keyUrl' is required when Customer-Managed Keys is enabled."
+                    Write-Host "##vso[task.logissue type=error]Either provide it as a pipeline parameter, or set 'managedHsmKeyUrl' in the JSON config file."
+                    $valid = $false
+                  } elseif ($keyUrl -notmatch "^https://.+\.managedhsm\.azure\.net/keys/.+/.+$") {
+                    Write-Host "##vso[task.logissue type=error]Invalid 'keyUrl' format: $keyUrl"
+                    Write-Host "##vso[task.logissue type=error]Expected: https://<hsm-name>.managedhsm.azure.net/keys/<key-name>/<key-version>"
+                    $valid = $false
+                  } else {
+                    Write-Host "✅ Managed HSM Key URL: $keyUrl"
+                  }
+                } else {
+                  Write-Host ""
+                  Write-Host "##[section]Platform-Managed Keys (PMK) mode - no DES or Managed HSM required"
+                  Write-Host "✅ Session hosts will use VMGuestStateOnly encryption with platform-managed keys"
+                }
+
+                # Validate vmSizeCC is present and is a Confidential Compute capable size
+                $vmSizeCC = $jsonParams.vmSizeCC
+                if ([string]::IsNullOrEmpty($vmSizeCC) -or $vmSizeCC -eq 'notinuse') {
+                  Write-Host "##vso[task.logissue type=error]'vmSizeCC' is missing or set to 'notinuse' in the JSON config."
+                  Write-Host "##vso[task.logissue type=error]Add a 'vmSizeCC' field with a CC-capable VM size (e.g., Standard_DC8as_v5, Standard_EC8as_v6)."
+                  $valid = $false
+                } elseif ($vmSizeCC -notmatch "^Standard_(DC|EC)\d+a?d?s?_v\d+$") {
+                  Write-Host "##vso[task.logissue type=error]VM size '$vmSizeCC' (vmSizeCC) is not a Confidential Compute capable size."
+                  Write-Host "##vso[task.logissue type=error]Confidential Compute requires DC-series or EC-series VMs (e.g., Standard_DC4as_v5, Standard_EC4as_v5)."
+                  Write-Host "##vso[task.logissue type=error]Please update 'vmSizeCC' in the JSON config file."
+                  $valid = $false
+                } else {
+                  Write-Host "✅ VM Size CC (CC capable): $vmSizeCC"
+                  Write-Host "   Standard VM Size (non-CC): $($jsonParams.vmSize)"
+                }
+
+                Write-Host "✅ Confidential Compute: Enabled"
+
+                if (-not $valid) {
+                  Write-Host "##vso[task.logissue type=error]Confidential Compute validation failed."
+                  exit 1
+                }
+
+                Write-Host "##[section]✅ Confidential Compute parameters validated successfully"
+            env:
+              jsonFilePath: ${{ parameters.jsonFilePath }}
+
+  - stage: InitializeParameters_${{ parameters.deploymentIdentifier }}
+    displayName: 'Initialize Parameters'
+    condition: |
+      and(
+        succeeded('approvalGate_${{ parameters.deploymentIdentifier }}'),
+        or(
+          eq('${{ parameters.confidentialCompute }}', 'false'),
+          succeeded('ValidateConfidentialCompute_${{ parameters.deploymentIdentifier }}')
+        )
+      )
+    dependsOn:
+      - approvalGate_${{ parameters.deploymentIdentifier }}
+      - ${{ if eq(parameters.confidentialCompute, true) }}:
+        - ValidateConfidentialCompute_${{ parameters.deploymentIdentifier }}
+    jobs:
+      - job: LoadParameters
+        displayName: 'Load and Validate Parameters'
+        steps:
+          - task: PowerShell@2
+            displayName: "Load parameters from JSON file"
+            inputs:
+              targetType: "inline"
+              script: |
+                try {
+                  $jsonFilePath = "$env:jsonFilePath"
+                  Write-Host "##[section]Loading JSON Configuration"
+                  Write-Host "JSON File: '$jsonFilePath'"
+                  Write-Host "Operation Type: $env:operationType"
+                  Write-Host "Host Count: $env:additionalHostCount"
+                  Write-Host "Confidential Compute: $env:confidentialCompute"
+
+                  if ([string]::IsNullOrEmpty($jsonFilePath)) {
+                      Write-Host "##vso[task.logissue type=error]Parameter 'jsonFilePath' is required but was not provided."
+                      exit 1
+                  } elseif (Test-Path $jsonFilePath) {
+                    $jsonParams = Get-Content $jsonFilePath | ConvertFrom-Json
+                    Write-Host "##[section]JSON file loaded successfully"
+                    
+                    # Validate required parameters exist in JSON
+                    $requiredParams = @("location","subscriptionname", "hostpoolname", "hostpoolresourcegroup", 
+                                      "vmSize", "vmNamePrefix", "subnetId", "DomainJoinKeyVaultID", 
+                                      "keyvaultname", "automationaccountname", "automationresourcegroup",
+                                      "LogAnalyticsWorkspaceId")
+                    
+                    $missingParams = @()
+                    foreach ($param in $requiredParams) {
+                      if (-not (Get-Member -InputObject $jsonParams -Name $param -MemberType Properties)) {
+                        $missingParams += $param
+                      }
+                    }
+                    
+                    if ($missingParams.Count -gt 0) {
+                      Write-Host "##vso[task.logissue type=error]Missing required parameters in JSON file:"
+                      foreach ($param in $missingParams) {
+                        Write-Host "##vso[task.logissue type=error]  - $param"
+                      }
+                      exit 1
+                    }
+                    
+                    # Set variables based on JSON content
+                    Write-Host "##[section]Setting pipeline variables..."
+                    Write-Host "##vso[task.setvariable variable=subscriptionname;isOutput=true]$($jsonParams.subscriptionname)"
+                    Write-Host "##vso[task.setvariable variable=location;isOutput=true]$($jsonParams.location)"
+                    
+                    # Use vmLocation for session hosts if specified, otherwise fall back to location
+                    $vmLocation = if ($jsonParams.vmLocation) { $jsonParams.vmLocation } else { $jsonParams.location }
+                    Write-Host "##vso[task.setvariable variable=vmLocation;isOutput=true]$vmLocation"
+                    Write-Host "VM Location for Session Hosts: $vmLocation"
+                    
+                    Write-Host "##vso[task.setvariable variable=hostpoolname;isOutput=true]$($jsonParams.hostpoolname)"
+                    Write-Host "##vso[task.setvariable variable=hostpoolresourcegroup;isOutput=true]$($jsonParams.hostpoolresourcegroup)"
+                    
+                    # Use hostsResourceGroup for VMs if specified, otherwise fall back to hostpoolresourcegroup
+                    $hostsRg = if ($jsonParams.hostsResourceGroup) { $jsonParams.hostsResourceGroup } else { $jsonParams.hostpoolresourcegroup }
+                    Write-Host "##vso[task.setvariable variable=hostsresourcegroup;isOutput=true]$hostsRg"
+                    Write-Host "Hosts Resource Group (VMs): $hostsRg"
+                    
+                    # Select the appropriate VM size based on Confidential Compute toggle
+                    $isCC = "${{ parameters.confidentialCompute }}" -eq "True"
+                    if ($isCC) {
+                      $vmSizeCC = if ($jsonParams.vmSizeCC) { $jsonParams.vmSizeCC } else { '' }
+                      if ([string]::IsNullOrEmpty($vmSizeCC) -or $vmSizeCC -eq 'notinuse') {
+                        Write-Host "##vso[task.logissue type=error]'vmSizeCC' is missing or set to 'notinuse' in the JSON config. Cannot enable Confidential Compute without a CC-capable VM size."
+                        exit 1
+                      }
+                      $effectiveVmSize = $vmSizeCC
+                      Write-Host "Confidential Compute enabled: using vmSizeCC '$effectiveVmSize' (standard vmSize: '$($jsonParams.vmSize)')"
+                    } else {
+                      $effectiveVmSize = $jsonParams.vmSize
+                      $vmSizeCC = if ($jsonParams.vmSizeCC) { $jsonParams.vmSizeCC } else { '' }
+                      Write-Host "Confidential Compute disabled: using vmSize '$effectiveVmSize' (CC vmSizeCC: '$vmSizeCC')"
+                    }
+                    Write-Host "##vso[task.setvariable variable=vmSize;isOutput=true]$effectiveVmSize"
+                    Write-Host "##vso[task.setvariable variable=vmNamePrefix;isOutput=true]$($jsonParams.vmNamePrefix)"
+                    Write-Host "##vso[task.setvariable variable=subnetId;isOutput=true]$($jsonParams.subnetId)"
+                    Write-Host "##vso[task.setvariable variable=DomainJoinKeyVaultID;isOutput=true]$($jsonParams.DomainJoinKeyVaultID)"
+                    Write-Host "##vso[task.setvariable variable=keyvaultname;isOutput=true]$($jsonParams.keyvaultname)"
+                    Write-Host "##vso[task.setvariable variable=LogAnalyticsWorkspaceId;isOutput=true]$($jsonParams.LogAnalyticsWorkspaceId)"
+                    Write-Host "##vso[task.setvariable variable=automationaccountname;isOutput=true]$($jsonParams.automationaccountname)"
+                    Write-Host "##vso[task.setvariable variable=automationresourcegroup;isOutput=true]$($jsonParams.automationresourcegroup)"
+                    
+                    # Set the pipeline parameters as variables (normalize 'none' sentinel to empty string)
+                    Write-Host "##vso[task.setvariable variable=operationType;isOutput=true]${{ parameters.operationType }}"
+                    Write-Host "##vso[task.setvariable variable=startingHostNumber;isOutput=true]${{ parameters.startingHostNumber }}"
+                    Write-Host "##vso[task.setvariable variable=additionalHostCount;isOutput=true]${{ parameters.additionalHostCount }}"
+                    $imageIdParam = "${{ parameters.ImageID }}"
+                    if ($imageIdParam -eq 'none') { $imageIdParam = '' }
+                    Write-Host "##vso[task.setvariable variable=SharedImageId;isOutput=true]$imageIdParam"
+                    $hostsToReplaceParam = "${{ parameters.hostsToReplace }}"
+                    if ($hostsToReplaceParam -eq 'none') { $hostsToReplaceParam = '' }
+                    Write-Host "##vso[task.setvariable variable=hostsToReplace;isOutput=true]$hostsToReplaceParam"
+                    Write-Host "##vso[task.setvariable variable=userWarningMessage;isOutput=true]${{ parameters.userWarningMessage }}"
+                    Write-Host "##vso[task.setvariable variable=warningDelayMinutes;isOutput=true]${{ parameters.warningDelayMinutes }}"
+                    Write-Host "##vso[task.setvariable variable=cleanupDelayDays;isOutput=true]${{ parameters.cleanupDelayDays }}"
+
+                    # Set marketplace image parameters from JSON config (used as fallback when SharedImageId is empty)
+                    $imagePublisher = if ($jsonParams.imagePublisher) { $jsonParams.imagePublisher } else { 'microsoftwindowsdesktop' }
+                    $imageOffer = if ($jsonParams.imageOffer) { $jsonParams.imageOffer } else { 'office-365' }
+                    $imageSku = if ($jsonParams.imageSku) { $jsonParams.imageSku } else { 'win11-24h2-avd-m365' }
+                    $imageVersion = if ($jsonParams.imageVersion) { $jsonParams.imageVersion } else { 'latest' }
+                    Write-Host "##vso[task.setvariable variable=imagePublisher;isOutput=true]$imagePublisher"
+                    Write-Host "##vso[task.setvariable variable=imageOffer;isOutput=true]$imageOffer"
+                    Write-Host "##vso[task.setvariable variable=imageSku;isOutput=true]$imageSku"
+                    Write-Host "##vso[task.setvariable variable=imageVersion;isOutput=true]$imageVersion"
+                    
+                    if ([string]::IsNullOrEmpty($imageIdParam)) {
+                      Write-Host "##[section]Image Source: Marketplace (${imagePublisher}/${imageOffer}/${imageSku}/${imageVersion})"
+                    } else {
+                      Write-Host "##[section]Image Source: Shared Image Gallery ($imageIdParam)"
+                    }
+
+                    # Set domain join type: pipeline parameter overrides JSON config value
+                    $domainJoinTypeParam = "${{ parameters.domainJoinType }}"
+                    if ($domainJoinTypeParam -eq 'fromConfig') {
+                      $domainJoinType = if ($jsonParams.domainJoinType) { $jsonParams.domainJoinType } else { 'AD' }
+                    } else {
+                      $domainJoinType = $domainJoinTypeParam
+                    }
+                    $isEntraJoin = if ($domainJoinType -eq 'EntraID') { 'true' } else { 'false' }
+                    Write-Host "##vso[task.setvariable variable=domainJoinType;isOutput=true]$domainJoinType"
+                    Write-Host "##vso[task.setvariable variable=isEntraJoin;isOutput=true]$isEntraJoin"
+                    Write-Host "##[section]Domain Join Type: $domainJoinType (Entra ID Join: $isEntraJoin)"
+
+                    # Set confidential compute variables
+                    Write-Host "##vso[task.setvariable variable=confidentialCompute;isOutput=true]${{ parameters.confidentialCompute }}"
+                    Write-Host "##vso[task.setvariable variable=customerManagedKeys;isOutput=true]${{ parameters.customerManagedKeys }}"
+
+                    # Read CC resource names from JSON config
+                    $diskEncryptionSetName = if ($jsonParams.diskEncryptionSetName) { $jsonParams.diskEncryptionSetName } else { '' }
+                    $keyVaultResourceGroup = if ($jsonParams.keyVaultResourceGroup) { $jsonParams.keyVaultResourceGroup } elseif ($jsonParams.keyvaultresourcegroup) { $jsonParams.keyvaultresourcegroup } else { '' }
+                    Write-Host "##vso[task.setvariable variable=diskEncryptionSetName;isOutput=true]$diskEncryptionSetName"
+                    Write-Host "##vso[task.setvariable variable=keyVaultResourceGroup;isOutput=true]$keyVaultResourceGroup"
+
+                    # keyUrl: pipeline parameter overrides JSON config value
+                    $keyUrlParam = "${{ parameters.keyUrl }}"
+                    if ($keyUrlParam -eq 'none') { $keyUrlParam = '' }
+                    $keyUrlJson = if ($jsonParams.managedHsmKeyUrl) { $jsonParams.managedHsmKeyUrl } else { '' }
+                    $keyUrl = if (-not [string]::IsNullOrEmpty($keyUrlParam)) { $keyUrlParam } else { $keyUrlJson }
+                    Write-Host "##vso[task.setvariable variable=keyUrl;isOutput=true]$keyUrl"
+                    
+                    Write-Host "##[section]✅ Parameters loaded successfully"
+                  } else {
+                    Write-Host "##vso[task.logissue type=error]JSON file not found at '$jsonFilePath'."
+                    exit 1
+                  }
+                } catch {
+                  Write-Host "##vso[task.logissue type=error]Error reading JSON file: $($_.Exception.Message)"
+                  exit 1
+                }
+            env:
+              jsonFilePath: ${{ parameters.jsonFilePath }}
+              operationType: ${{ parameters.operationType }}
+              additionalHostCount: ${{ parameters.additionalHostCount }}
+              confidentialCompute: ${{ parameters.confidentialCompute }}
+            name: setVariables
+
+          - task: PowerShell@2
+            displayName: "Display loaded variables"
+            inputs:
+              targetType: "inline"
+              script: |
+                Write-Host "##[section]=============== LOADED VARIABLES ==============="
+                
+                $operationType = $env:OPERATION_TYPE
+                $subscriptionname = $env:SUBSCRIPTION_NAME
+                $location = $env:LOCATION
+                $hostpoolname = $env:HOSTPOOL_NAME
+                $hostpoolresourcegroup = $env:HOSTPOOL_RG
+                $vmSize = $env:VM_SIZE
+                $vmNamePrefix = $env:VM_PREFIX
+                $additionalHostCount = $env:HOST_COUNT
+                $startingHostNumber = $env:START_NUMBER
+                $hostsToReplace = $env:HOSTS_TO_REPLACE
+                $warningDelay = $env:WARNING_DELAY
+                $cleanupDelay = $env:CLEANUP_DELAY
+                $confidentialCompute = $env:CONFIDENTIAL_COMPUTE
+                $domainJoinType = $env:DOMAIN_JOIN_TYPE
+                
+                Write-Host "Operation Type: $operationType"
+                Write-Host "Subscription Name: $subscriptionname"
+                Write-Host "Location: $location"
+                Write-Host "Hostpool Name: $hostpoolname"
+                Write-Host "Hostpool Resource Group: $hostpoolresourcegroup"
+                Write-Host "VM size (effective): $vmSize"
+                Write-Host "VM name prefix: $vmNamePrefix"
+                Write-Host "Host Count: $additionalHostCount"
+                Write-Host "Confidential Compute: $confidentialCompute"
+                Write-Host "Domain Join Type: $domainJoinType"
+                
+                if ($confidentialCompute -eq 'True') {
+                  Write-Host "  → Using CC VM size (vmSizeCC from JSON)"
+                  Write-Host "  → Customer-Managed Keys: $env:CUSTOMER_MANAGED_KEYS"
+                  if ($env:CUSTOMER_MANAGED_KEYS -eq 'True') {
+                    Write-Host "Disk Encryption Set Name: $env:DISK_ENCRYPTION_SET_NAME"
+                    Write-Host "Key Vault Resource Group (DES): $env:KV_RESOURCE_GROUP"
+                    Write-Host "Managed HSM Key URL: $env:KEY_URL"
+                  } else {
+                    Write-Host "  → Platform-Managed Keys (PMK) - no DES or HSM needed"
+                  }
+                }
+                
+                if ($operationType -eq 'add') {
+                  Write-Host "Starting Host Number: $startingHostNumber"
+                } else {
+                  if ([string]::IsNullOrEmpty($hostsToReplace)) {
+                    Write-Host "Hosts to Replace: (All hosts)"
+                  } else {
+                    Write-Host "Hosts to Replace: $hostsToReplace"
+                  }
+                  Write-Host "Warning Delay: $warningDelay minutes"
+                  Write-Host "Cleanup Delay: $cleanupDelay days"
+                }
+                
+                Write-Host "Build ID: $env:BUILD_BUILDID"
+                Write-Host "Build Number: $env:BUILD_BUILDNUMBER"
+                Write-Host "Requested By: $env:BUILD_REQUESTEDFOR"
+                Write-Host "================================================"
+            env:
+              OPERATION_TYPE: $(setVariables.operationType)
+              SUBSCRIPTION_NAME: $(setVariables.subscriptionname)
+              LOCATION: $(setVariables.location)
+              HOSTPOOL_NAME: $(setVariables.hostpoolname)
+              HOSTPOOL_RG: $(setVariables.hostpoolresourcegroup)
+              VM_SIZE: $(setVariables.vmSize)
+              VM_PREFIX: $(setVariables.vmNamePrefix)
+              HOST_COUNT: $(setVariables.additionalHostCount)
+              START_NUMBER: $(setVariables.startingHostNumber)
+              HOSTS_TO_REPLACE: $(setVariables.hostsToReplace)
+              WARNING_DELAY: $(setVariables.warningDelayMinutes)
+              CLEANUP_DELAY: $(setVariables.cleanupDelayDays)
+              CONFIDENTIAL_COMPUTE: $(setVariables.confidentialCompute)
+              CUSTOMER_MANAGED_KEYS: $(setVariables.customerManagedKeys)
+              DOMAIN_JOIN_TYPE: $(setVariables.domainJoinType)
+              DISK_ENCRYPTION_SET_NAME: $(setVariables.diskEncryptionSetName)
+              KV_RESOURCE_GROUP: $(setVariables.keyVaultResourceGroup)
+              KEY_URL: $(setVariables.keyUrl)
+              BUILD_BUILDID: $(Build.BuildId)
+              BUILD_BUILDNUMBER: $(Build.BuildNumber)
+              BUILD_REQUESTEDFOR: $(Build.RequestedFor)
+
+  - stage: RetrieveExistingResources_${{ parameters.deploymentIdentifier }}
+    displayName: "Retrieve Existing AVD Resources"
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      hostpoolname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolname'] ]
+      hostpoolresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolresourcegroup'] ]
+      keyvaultname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.keyvaultname'] ]
+      operationType: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.operationType'] ]
+      hostsToReplace: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostsToReplace'] ]
+    jobs:
+      - job: RetrieveResources
+        displayName: 'Retrieve Resources'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Retrieve Existing Resources"
+            name: existingResources
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Set error action preference to continue on warnings
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                
+                # Suppress Azure CLI warnings
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+                
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "##[section]Retrieving Host Pool Information"
+                
+                # Get the actual subscription ID (not the name)
+                $subscriptionId = az account show --query "id" -o tsv 2>$null
+                Write-Host "Subscription ID: $subscriptionId"
+                
+                # Get Host Pool ID
+                $apiVersion = "2023-09-05"
+                $hostPoolUri = "https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/$(hostpoolresourcegroup)/providers/Microsoft.DesktopVirtualization/hostPools/$(hostpoolname)?api-version=${apiVersion}"
+                
+                $hostPoolResult = az rest --method GET --uri "$hostPoolUri" 2>$null
+                if ($LASTEXITCODE -eq 0) {
+                    $hostPoolData = $hostPoolResult | ConvertFrom-Json
+                    $hostPool = $hostPoolData.id
+                    Write-Host "✅ Host Pool ID: $hostPool"
+                    Write-Host "##vso[task.setvariable variable=hostPoolId;isOutput=true]$hostPool"
+                } else {
+                    Write-Host "##vso[task.logissue type=error]Host Pool '$(hostpoolname)' not found."
+                    exit 1
+                }
+                
+                # Get existing session hosts if this is a replace operation
+                if ("$(operationType)" -eq "replace") {
+                  Write-Host "##[section]Retrieving Session Hosts for Replacement"
+                  
+                  # Build the correct URI for session hosts
+                  $sessionHostsUri = "https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/$(hostpoolresourcegroup)/providers/Microsoft.DesktopVirtualization/hostPools/$(hostpoolname)/sessionHosts?api-version=${apiVersion}"
+                  
+                  Write-Host "REST URI: $sessionHostsUri"
+                  
+                  # Get session hosts
+                  $result = az rest --method GET --uri "$sessionHostsUri" -o json 2>&1
+                  
+                  # Clean the result by removing warning lines
+                  $resultLines = $result -split "`n"
+                  $jsonLines = $resultLines | Where-Object { $_ -notmatch "^WARNING:" -and $_ -ne "" }
+                  $cleanJson = $jsonLines -join "`n"
+                  
+                  # Parse the JSON
+                  try {
+                    $sessionHostsData = $cleanJson | ConvertFrom-Json
+                    
+                    if ($sessionHostsData.value -and $sessionHostsData.value.Count -gt 0) {
+                      Write-Host "✅ Found $($sessionHostsData.value.Count) session host(s)"
+                      
+                      # Transform to expected format
+                      $transformedData = $sessionHostsData.value | ForEach-Object {
+                        $hostName = $_.name -split "/" | Select-Object -Last 1
+                        Write-Host "  - Found host: $hostName"
+                        @{
+                          name = $_.name
+                          resourceId = $_.id
+                          status = $_.properties.status
+                          sessions = if ($_.properties.sessions) { $_.properties.sessions } else { 0 }
+                          allowNewSession = $_.properties.allowNewSession
+                        }
+                      }
+                      
+                      # Handle host filtering
+                      $hostsToReplaceParam = "$(hostsToReplace)"
+                      
+                      if ([string]::IsNullOrEmpty($hostsToReplaceParam) -or $hostsToReplaceParam.ToLower() -eq "all") {
+                        $hostsToProcess = $transformedData
+                        Write-Host "Will replace ALL $($transformedData.Count) hosts"
+                      } else {
+                        # User specified specific hosts
+                        $hostsFilter = $hostsToReplaceParam -split "," | ForEach-Object { $_.Trim() }
+                        
+                        $hostsToProcess = $transformedData | Where-Object { 
+                          $hostName = $_.name -split "/" | Select-Object -Last 1
+                          $hostNameNoDomain = $hostName -replace '\..*$', ''
+                          
+                          # Check both full name and name without domain
+                          ($hostsFilter -contains $hostName) -or ($hostsFilter -contains $hostNameNoDomain)
+                        }
+                        
+                        Write-Host "Filtering to specified hosts: $($hostsFilter -join ', ')"
+                        Write-Host "Matched $($hostsToProcess.Count) hosts"
+                      }
+                      
+                      if ($hostsToProcess.Count -eq 0) {
+                        Write-Host "##vso[task.logissue type=error]No matching hosts found to replace."
+                        exit 1
+                      }
+                      
+                      $hostsList = $hostsToProcess | ConvertTo-Json -Compress
+                      Write-Host "##vso[task.setvariable variable=hostsToProcess;isOutput=true]$hostsList"
+                      
+                    } else {
+                      Write-Host "##vso[task.logissue type=warning]No session hosts found in host pool"
+                      Write-Host "##vso[task.setvariable variable=hostsToProcess;isOutput=true][]"
+                    }
+                  } catch {
+                    Write-Host "##vso[task.logissue type=error]Error parsing session hosts: $_"
+                    exit 1
+                  }
+                }
+                
+                Write-Host "##[section]Retrieving KeyVault Information"
+                # Get KeyVault ID
+                $keyVaultOutput = az keyvault show `
+                  --name "$(keyvaultname)" `
+                  --query "id" -o tsv 2>&1
+                
+                $keyVault = $keyVaultOutput | Where-Object { $_ -notmatch "WARNING:|ERROR:" -and $_ -ne "" } | Select-Object -First 1
+                
+                if ([string]::IsNullOrEmpty($keyVault) -or $keyVault -notmatch "^/subscriptions/") {
+                  Write-Host "##vso[task.logissue type=error]KeyVault '$(keyvaultname)' not found in subscription '$(subscriptionname)'. Please verify the 'keyVaultName' value in the JSON configuration file."
+                  Write-Host "##vso[task.logissue type=error]az keyvault show output: $keyVaultOutput"
+                  exit 1
+                }
+                
+                Write-Host "✅ KeyVault ID: $keyVault"
+                Write-Host "##vso[task.setvariable variable=keyVaultId;isOutput=true]$keyVault"
+                
+                # Get KeyVault Resource Group
+                if ($keyVault -match "/resourceGroups/([^/]+)/") {
+                  $kvResourceGroup = $matches[1]
+                  Write-Host "✅ KeyVault Resource Group: $kvResourceGroup"
+                  Write-Host "##vso[task.setvariable variable=kvResourceGroup;isOutput=true]$kvResourceGroup"
+                } else {
+                  Write-Host "##vso[task.logissue type=error]Could not extract resource group from KeyVault ID: $keyVault"
+                  exit 1
+                }
+                
+                Write-Host "##[section]Retrieving Managed Identity"
+                # Get Managed Identity ID (Key Vault UAMI, NOT the CC UAMI)
+                # Exclude CC UAMIs (uami-cc-*) which are used for Disk Encryption Sets
+                $managedIdentitiesJson = az identity list `
+                  --resource-group "$kvResourceGroup" `
+                  --query "[?contains(name, 'uami-') && !contains(name, 'uami-cc-')]" 2>&1
+                
+                $managedIdentitiesJson = $managedIdentitiesJson | Where-Object { $_ -notmatch "WARNING:" } | Out-String
+                
+                if (-not [string]::IsNullOrWhiteSpace($managedIdentitiesJson)) {
+                  $managedIdentities = $managedIdentitiesJson | ConvertFrom-Json
+                  
+                  if ($managedIdentities -and $managedIdentities.Count -gt 0) {
+                    $managedIdentityId = $managedIdentities[0].id
+                    Write-Host "✅ Managed Identity ID: $managedIdentityId"
+                    Write-Host "##vso[task.setvariable variable=managedIdentityId;isOutput=true]$managedIdentityId"
+                  } else {
+                    Write-Host "##vso[task.logissue type=error]No managed identity found in resource group '$kvResourceGroup'."
+                    exit 1
+                  }
+                } else {
+                  Write-Host "##vso[task.logissue type=error]No managed identity found in resource group '$kvResourceGroup'."
+                  exit 1
+                }
+                
+                Write-Host "##[section]Retrieving Data Collection Rule"
+                # Get Data Collection Rule ID
+                $dataCollectionRulesJson = $null
+                try {
+                    $dataCollectionRulesJson = az monitor data-collection rule list `
+                      --resource-group "$(hostpoolresourcegroup)" `
+                      --query "[?contains(name, 'microsoft-avdi')]" 2>&1
+                    
+                    $dataCollectionRulesJson = $dataCollectionRulesJson | Where-Object { 
+                        $_ -notmatch "WARNING:" -and $_ -ne "" 
+                    } | Out-String
+                    
+                    if (-not [string]::IsNullOrWhiteSpace($dataCollectionRulesJson)) {
+                        $dataCollectionRules = $dataCollectionRulesJson | ConvertFrom-Json
+                        
+                        if ($dataCollectionRules -and $dataCollectionRules.Count -gt 0) {
+                          $dataCollectionRuleId = $dataCollectionRules[0].id
+                          Write-Host "✅ Data Collection Rule ID: $dataCollectionRuleId"
+                          Write-Host "##vso[task.setvariable variable=dataCollectionRuleId;isOutput=true]$dataCollectionRuleId"
+                        } else {
+                          Write-Host "⚠️ No data collection rule found. Hosts will be deployed without monitoring."
+                          Write-Host "##vso[task.setvariable variable=dataCollectionRuleId;isOutput=true]"
+                        }
+                    } else {
+                        Write-Host "⚠️ No data collection rule found. Hosts will be deployed without monitoring."
+                        Write-Host "##vso[task.setvariable variable=dataCollectionRuleId;isOutput=true]"
+                    }
+                } catch {
+                    Write-Host "⚠️ Error retrieving data collection rule: $_. Hosts will be deployed without monitoring."
+                    Write-Host "##vso[task.setvariable variable=dataCollectionRuleId;isOutput=true]"
+                }
+                
+                Write-Host "##[section]✅ Resource retrieval completed successfully"
+
+  # Register Confidential Compute feature flags (only when Confidential Compute is enabled)
+  - stage: RegisterCCFeatures_${{ parameters.deploymentIdentifier }}
+    displayName: "Register Confidential Compute Feature Flags"
+    condition: and(succeeded(), eq('${{ parameters.confidentialCompute }}', 'true'))
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      vmSize: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.vmSize'] ]
+    jobs:
+      - job: RegisterFeatures
+        displayName: 'Register CC Feature Flags'
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: "Register Required Feature Flags"
+            name: "registerFeatures"
+            continueOnError: true
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "scriptPath"
+              scriptPath: "$(System.DefaultWorkingDirectory)/Scripts/Register-CCFeatureFlags.ps1"
+              arguments: '-SubscriptionName "$(subscriptionname)" -VmSize "$(vmSize)"'
+
+  # Deploy Disk Encryption Set (only when Confidential Compute + Customer-Managed Keys is enabled)
+  - stage: DeployDiskEncryptionSet_${{ parameters.deploymentIdentifier }}
+    displayName: "Deploy Disk Encryption Set"
+    condition: and(not(failed()), eq('${{ parameters.confidentialCompute }}', 'true'), eq('${{ parameters.customerManagedKeys }}', 'true'))
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - RetrieveExistingResources_${{ parameters.deploymentIdentifier }}
+      - RegisterCCFeatures_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      vmLocation: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.vmLocation'] ]
+      hostpoolname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolname'] ]
+      keyVaultResourceGroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.keyVaultResourceGroup'] ]
+      diskEncryptionSetName: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.diskEncryptionSetName'] ]
+      keyUrl: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.keyUrl'] ]
+    jobs:
+      - job: Deploy
+        displayName: 'Deploy DES'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Retrieve CC UAMI"
+            name: "ccIdentity"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $ErrorActionPreference = 'Stop'
+                az account set --subscription $(subscriptionname)
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to set subscription to '$(subscriptionname)'"
+                  exit 1
+                }
+
+                $uamiName = "uami-cc-$(hostpoolname)"
+                $resourceGroup = "$(keyVaultResourceGroup)"
+
+                Write-Host "##[section]Looking up CC UAMI '$uamiName' in resource group '$resourceGroup'"
+
+                $uamiJson = az identity show --name $uamiName --resource-group $resourceGroup 2>$null
+                if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($uamiJson)) {
+                  Write-Host "##vso[task.logissue type=error]CC UAMI '$uamiName' not found in resource group '$resourceGroup'."
+                  Write-Host "##vso[task.logissue type=error]Run the HostPool Deployment pipeline with Confidential Compute enabled first to create the UAMI."
+                  exit 1
+                }
+
+                $uami = $uamiJson | ConvertFrom-Json
+                $uamiId = $uami.id
+
+                if ([string]::IsNullOrEmpty($uamiId)) {
+                  Write-Host "##vso[task.logissue type=error]CC UAMI '$uamiName' was found but has no resource ID. This should not happen."
+                  exit 1
+                }
+
+                Write-Host "✅ CC UAMI found: $uamiId"
+                Write-Host "##vso[task.setvariable variable=ccUamiId;isOutput=true]$uamiId"
+
+          - task: AzureCLI@2
+            displayName: "Deploy Disk Encryption Set"
+            name: "deployDES"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $ErrorActionPreference = 'Stop'
+                az account set --subscription $(subscriptionname)
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to set subscription to '$(subscriptionname)'"
+                  exit 1
+                }
+
+                $resourceGroup = "$(keyVaultResourceGroup)"
+                $desName = "$(diskEncryptionSetName)"
+                $ccUamiId = "$(ccIdentity.ccUamiId)"
+                $keyUrl = "$(keyUrl)"
+
+                # Resolve the Managed HSM location from the key URL
+                # The DES must be in the same region as the HSM, NOT the VM region
+                $hsmName = ""
+                if ($keyUrl -match "^https://([^.]+)\.managedhsm\.azure\.net") {
+                  $hsmName = $matches[1]
+                }
+
+                $desLocation = "$(vmLocation)"
+                if (-not [string]::IsNullOrEmpty($hsmName)) {
+                  Write-Host "Resolving location for Managed HSM '$hsmName'..."
+                  # Search for the HSM across all subscriptions the SPN has access to
+                  $allSubs = az account list --query "[].id" -o tsv 2>$null
+                  foreach ($subId in $allSubs) {
+                    $hsmLocation = az rest --method GET `
+                      --uri "https://management.azure.com/subscriptions/$subId/providers/Microsoft.KeyVault/managedHSMs?api-version=2023-07-01" `
+                      --query "value[?name=='$hsmName'].location | [0]" -o tsv 2>$null
+                    if (-not [string]::IsNullOrEmpty($hsmLocation)) {
+                      $desLocation = $hsmLocation
+                      Write-Host "[OK] Managed HSM '$hsmName' found in subscription '$subId', region '$desLocation'"
+                      break
+                    }
+                  }
+                  if ($desLocation -eq "$(vmLocation)") {
+                    Write-Host "##[warning]Could not resolve Managed HSM location. Falling back to VM location '$(vmLocation)'."
+                    Write-Host "##[warning]If the HSM is in a different region, the deployment will fail. Add the HSM subscription to the SPN access."
+                  }
+                }
+
+                if ($desLocation -ne "$(vmLocation)") {
+                  Write-Host "##[warning]DES location '$desLocation' differs from VM location '$(vmLocation)'. DES must be co-located with the Managed HSM."
+                }
+
+                Write-Host "##[section]Deploying Disk Encryption Set"
+                Write-Host "DES Name: $desName"
+                Write-Host "Resource Group: $resourceGroup"
+                Write-Host "UAMI ID: $ccUamiId"
+                Write-Host "Key URL: $keyUrl"
+                Write-Host "DES Location: $desLocation"
+
+                $templateFile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/DiskEncryptionSet/main.bicep"
+                $parametersFile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/DiskEncryptionSet/main.parameters.json"
+
+                if (-not (Test-Path $templateFile)) {
+                  Write-Host "##vso[task.logissue type=error]Template file '$templateFile' not found."
+                  exit 1
+                }
+
+                # Load the parameter file and set the hostpool tag dynamically
+                $params = Get-Content $parametersFile -Raw | ConvertFrom-Json
+                $params.parameters.diskEncryptionSetName.value = $desName
+                $params.parameters.userAssignedIdentityId.value = $ccUamiId
+                $params.parameters.keyUrl.value = $keyUrl
+                $params.parameters.tags.value.hostpool = "$(hostpoolname)"
+
+                $runtimeParametersFile = "$(Agent.TempDirectory)/des-parameters.json"
+                $params | ConvertTo-Json -Depth 5 | Set-Content -Path $runtimeParametersFile -Encoding UTF8
+
+                $ErrorActionPreference = 'Continue'
+                $maxRetries = 3
+                $retryDelay = 30
+                $output = $null
+                for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+                  Write-Host "Deployment attempt $attempt of $maxRetries..."
+                  $output = az deployment group create `
+                    --resource-group $resourceGroup `
+                    --name "Deploy-DES-$(hostpoolname)-$(Build.BuildId)" `
+                    --template-file $templateFile `
+                    --parameters "@$runtimeParametersFile" `
+                    --parameters location="$desLocation" 2>&1
+
+                  if ($LASTEXITCODE -eq 0) {
+                    Write-Host "✅ Deployment succeeded on attempt $attempt"
+                    break
+                  }
+
+                  $outputStr = $output | Out-String
+                  if ($outputStr -match "internal server error" -and $attempt -lt $maxRetries) {
+                    Write-Host "##[warning]Transient internal server error on attempt $attempt. Retrying in $retryDelay seconds..."
+                    Start-Sleep -Seconds $retryDelay
+                    $retryDelay = $retryDelay * 2
+                  } else {
+                    Write-Host "##vso[task.logissue type=error]Failed to deploy Disk Encryption Set"
+                    Write-Host "Error: $output"
+                    exit 1
+                  }
+                }
+
+                # Filter out any warning lines from Azure CLI output before parsing JSON
+                $jsonOutput = ($output | Where-Object { $_ -notmatch "^WARNING:" -and $_ -ne "" }) -join "`n"
+                $desOutput = $jsonOutput | ConvertFrom-Json
+                $diskEncryptionSetId = $desOutput.properties.outputs.diskEncryptionSetId.value
+
+                if ([string]::IsNullOrEmpty($diskEncryptionSetId)) {
+                  Write-Host "##vso[task.logissue type=error]Disk Encryption Set deployment succeeded but output 'diskEncryptionSetId' is empty."
+                  exit 1
+                }
+
+                Write-Host "✅ Disk Encryption Set deployed successfully"
+                Write-Host "DES ID: $diskEncryptionSetId"
+                Write-Host "##vso[task.setvariable variable=diskEncryptionSetId;isOutput=true]$diskEncryptionSetId"
+
+  # Replacement workflow stages (only run for replace operations)
+  - stage: DisableLogons_${{ parameters.deploymentIdentifier }}
+    displayName: "Disable Logons on Hosts to Replace"
+    condition: and(succeeded(), eq(variables.isReplaceOperation, true))
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - RetrieveExistingResources_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      hostpoolname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolname'] ]
+      hostpoolresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolresourcegroup'] ]
+      hostsToProcess: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.hostsToProcess'] ]
+    jobs:
+      - job: DisableLogons
+        displayName: 'Disable New Sessions'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Disable Logons on Target Hosts"
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Suppress Azure CLI warnings about updates
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+                $ErrorActionPreference = 'Continue'
+                
+                az account set --subscription $(subscriptionname)
+                
+                # Install the desktop virtualization extension if not already installed
+                Write-Host "Ensuring desktopvirtualization extension is installed..."
+                try {
+                    $null = az extension add --name desktopvirtualization --yes --allow-preview false 2>$null
+                } catch {
+                    # Ignore installation warnings
+                }
+                
+                # Check if desktopvirtualization commands are available
+                Write-Host "Checking available desktopvirtualization commands..."
+                $useRestApi = $true
+                try {
+                    $helpTest = az desktopvirtualization 2>$null
+                    if ($?) {
+                        Write-Host "Azure CLI desktopvirtualization commands appear to be available"
+                        $useRestApi = $false
+                    }
+                } catch {
+                    Write-Host "##[warning]Azure CLI desktopvirtualization commands not available, will use REST API"
+                }
+                
+                Write-Host "##[section]Disabling new sessions on hosts to be replaced"
+                
+                $hostsJson = '$(hostsToProcess)'
+                $hosts = $hostsJson | ConvertFrom-Json
+                
+                $successCount = 0
+                $failCount = 0
+                
+                foreach ($sessionHost in $hosts) {
+                  $hostName = $sessionHost.name -split "/" | Select-Object -Last 1
+                  Write-Host "Processing host: $hostName"
+                  
+                  # Always use REST API for reliability
+                  try {
+                    $resourceId = $sessionHost.resourceId
+                    $apiVersion = "2023-09-05"
+                    $uri = "${resourceId}?api-version=${apiVersion}"
+                    
+                    # Create the JSON body for the update - use a plain JSON string
+                    # to avoid encoding issues with ConvertTo-Json and Out-File BOM
+                    $body = '{"properties":{"allowNewSession":false}}'
+                    
+                    # Save body to temp file using ASCII/no-BOM encoding
+                    # Windows PowerShell's Out-File -Encoding UTF8 adds a BOM which
+                    # causes az rest to silently fail to parse the body
+                    $tempBodyFile = [System.IO.Path]::GetTempFileName()
+                    [System.IO.File]::WriteAllText($tempBodyFile, $body)
+                    
+                    Write-Host "  Using REST API to disable logons..."
+                    $restResult = az rest --method PATCH --uri "$uri" --body "@$tempBodyFile" 2>&1
+                    
+                    if ($LASTEXITCODE -eq 0) {
+                      # Verify the change was actually applied
+                      $verifyResult = az rest --method GET --uri "$uri" -o json 2>$null
+                      $verifyData = $verifyResult | ConvertFrom-Json
+                      if ($verifyData.properties.allowNewSession -eq $false) {
+                        Write-Host "  ✅ Successfully disabled logons on $hostName (verified)"
+                        $successCount++
+                      } else {
+                        Write-Host "  ⚠️ REST API returned success but allowNewSession is still $($verifyData.properties.allowNewSession)"
+                        Write-Host "  Retrying with inline body..."
+                        $null = az rest --method PATCH --uri "$uri" --body "$body" 2>&1
+                        if ($LASTEXITCODE -eq 0) {
+                          Write-Host "  ✅ Retry succeeded"
+                          $successCount++
+                        } else {
+                          Write-Host "  ❌ Retry also failed"
+                          $failCount++
+                        }
+                      }
+                    } else {
+                      Write-Host "  ❌ Failed to disable logons on $hostName"
+                      Write-Host "  Error: $restResult"
+                      $failCount++
+                    }
+                    
+                    Remove-Item $tempBodyFile -Force -ErrorAction SilentlyContinue
+                  } catch {
+                    Write-Host "  ❌ Error disabling logons on $hostName $_"
+                    $failCount++
+                  }
+                }
+                
+                Write-Host ""
+                Write-Host "##[section]Summary"
+                Write-Host "✅ Successfully disabled: $successCount hosts"
+                if ($failCount -gt 0) {
+                  Write-Host "❌ Failed: $failCount hosts"
+                  Write-Host "##vso[task.logissue type=warning]Failed to disable logons on $failCount hosts"
+                }
+
+  - stage: SendUserWarning_${{ parameters.deploymentIdentifier }}
+    displayName: "Send Warning to Users"
+    condition: and(succeeded(), eq(variables.isReplaceOperation, true))
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - RetrieveExistingResources_${{ parameters.deploymentIdentifier }}
+      - DisableLogons_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      hostpoolname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolname'] ]
+      hostpoolresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolresourcegroup'] ]
+      userWarningMessage: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.userWarningMessage'] ]
+      warningDelayMinutes: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.warningDelayMinutes'] ]
+      hostsToProcess: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.hostsToProcess'] ]
+    jobs:
+      - job: SendWarning
+        displayName: 'Notify Users'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Send Warning Messages to Users"
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Suppress Azure CLI warnings
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+                $ErrorActionPreference = 'Continue'
+                
+                az account set --subscription $(subscriptionname)
+                
+                # Create the actual warning message with time included
+                $warningMinutes = $(warningDelayMinutes)
+                $baseMessage = "$(userWarningMessage)"
+                
+                # Replace time placeholder in the message
+                $actualWarningMessage = $baseMessage -replace '\{minutes\}', $warningMinutes
+                $actualWarningMessage = $actualWarningMessage -replace '\{time\}', $warningMinutes
+                
+                # If no placeholder was found and no time is in the message, prepend it
+                if ($actualWarningMessage -eq $baseMessage -and $baseMessage -notmatch '\d+\s*minute') {
+                  $actualWarningMessage = "System maintenance will begin in $warningMinutes minutes. " + $baseMessage
+                }
+                
+                Write-Host "##[section]Processing user notifications"
+                Write-Host "Warning message: '$actualWarningMessage'"
+                Write-Host "Warning delay: $warningMinutes minutes"
+                
+                $hostsJson = '$(hostsToProcess)'
+                $hosts = $hostsJson | ConvertFrom-Json
+                
+                # Get active user sessions using REST API
+                $activeSessions = @()
+                $uniqueUsers = @{}
+                
+                foreach ($sessionHost in $hosts) {
+                  $hostName = $sessionHost.name -split "/" | Select-Object -Last 1
+                  Write-Host "Checking sessions on host: $hostName"
+                  
+                  try {
+                    # Use REST API to get user sessions
+                    $resourceId = $sessionHost.resourceId
+                    $apiVersion = "2023-09-05"
+                    $uri = "${resourceId}/userSessions?api-version=${apiVersion}"
+                    
+                    $sessionsResult = az rest --method GET --uri "$uri" 2>$null
+                    
+                    if ($LASTEXITCODE -eq 0 -and $sessionsResult) {
+                      $sessionsData = $sessionsResult | ConvertFrom-Json
+                      
+                      if ($sessionsData.value) {
+                        foreach ($session in $sessionsData.value) {
+                          # Include both Active and Disconnected sessions
+                          if ($session.properties.sessionState -eq 'Active' -or $session.properties.sessionState -eq 'Disconnected') {
+                            $userPrincipalName = $session.properties.userPrincipalName
+                            $sessionState = $session.properties.sessionState
+                            $activeSessions += @{
+                              userPrincipalName = $userPrincipalName
+                              sessionId = $session.name
+                              hostName = $hostName
+                              state = $sessionState
+                            }
+                            
+                            # Track unique users
+                            if (-not $uniqueUsers.ContainsKey($userPrincipalName)) {
+                              $uniqueUsers[$userPrincipalName] = @()
+                            }
+                            $uniqueUsers[$userPrincipalName] += "$hostName ($sessionState)"
+                          }
+                        }
+                      }
+                    }
+                  } catch {
+                    Write-Host "##vso[task.logissue type=warning]Error retrieving sessions for $hostName $_"
+                  }
+                }
+                
+                Write-Host ""
+                Write-Host "##[section]Session Summary"
+                Write-Host "Total sessions (Active/Disconnected): $($activeSessions.Count)"
+                Write-Host "Unique users affected: $($uniqueUsers.Count)"
+                
+                if ($uniqueUsers.Count -gt 0) {
+                  Write-Host ""
+                  Write-Host "Affected users:"
+                  foreach ($user in $uniqueUsers.Keys) {
+                    $hostsForUser = $uniqueUsers[$user] -join ", "
+                    Write-Host "  - $user (on: $hostsForUser)"
+                  }
+                  
+                  Write-Host ""
+                  Write-Host "##[warning]Note: Actual user notification implementation required"
+                  Write-Host "Message to be sent: '$actualWarningMessage'"
+                  
+                  # Create a notification file for audit purposes
+                  $notificationFile = "user-notifications-$(Build.BuildId).json"
+                  $notificationFilePath = Join-Path "$(System.DefaultWorkingDirectory)" $notificationFile
+                  
+                  $notificationContent = @{
+                    timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    buildId = "$(Build.BuildId)"
+                    hostpool = "$(hostpoolname)"
+                    message = $actualWarningMessage
+                    warningDelayMinutes = $warningMinutes
+                    affectedUsers = $uniqueUsers
+                  } | ConvertTo-Json -Depth 10
+                  
+                  # Save the file
+                  $notificationContent | Out-File -FilePath $notificationFilePath -Encoding UTF8
+                  
+                  if (Test-Path $notificationFilePath) {
+                    Write-Host ""
+                    Write-Host "Notification file created at: $notificationFilePath"
+                    Write-Host "Uploading as pipeline artifact..."
+                    Write-Host "##vso[task.uploadfile]$notificationFilePath"
+                  } else {
+                    Write-Host "##vso[task.logissue type=warning]Failed to create notification file"
+                  }
+                  
+                } else {
+                  Write-Host ""
+                  Write-Host "##[section]No active user sessions found. No warnings needed."
+                }
+                
+                # Wait for the specified warning delay
+                if ($activeSessions.Count -gt 0 -and $warningMinutes -gt 0) {
+                  Write-Host ""
+                  Write-Host "##[section]Waiting $warningMinutes minutes before proceeding to logoff users..."
+                  
+                  $endTime = (Get-Date).AddMinutes($warningMinutes)
+                  $totalSeconds = $warningMinutes * 60
+                  
+                  for ($i = 0; $i -lt $totalSeconds; $i += 30) {
+                    $remaining = $endTime - (Get-Date)
+                    if ($remaining.TotalSeconds -gt 0) {
+                      Write-Host "Time remaining: $([math]::Round($remaining.TotalMinutes, 1)) minutes..."
+                      Start-Sleep -Seconds ([math]::Min(30, $remaining.TotalSeconds))
+                    }
+                  }
+                  
+                  Write-Host "Warning period complete. Proceeding with user logoff..."
+                }
+
+  - stage: LogoffUsers_${{ parameters.deploymentIdentifier }}
+    displayName: "Logoff Users from Target Hosts"
+    condition: and(succeeded(), eq(variables.isReplaceOperation, true))
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - RetrieveExistingResources_${{ parameters.deploymentIdentifier }}
+      - DisableLogons_${{ parameters.deploymentIdentifier }}
+      - SendUserWarning_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      hostpoolname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolname'] ]
+      hostpoolresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolresourcegroup'] ]
+      hostsToProcess: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.hostsToProcess'] ]
+    jobs:
+      - job: LogoffUsers
+        displayName: 'Force Logoff Users'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Force Logoff All Users"
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Suppress Azure CLI warnings
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+                $ErrorActionPreference = 'Continue'
+                
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "##[section]Logging off all users from target hosts"
+                
+                $hostsJson = '$(hostsToProcess)'
+                $hosts = $hostsJson | ConvertFrom-Json
+                
+                $totalLoggedOff = 0
+                $totalFailed = 0
+                
+                foreach ($sessionHost in $hosts) {
+                  $hostName = $sessionHost.name -split "/" | Select-Object -Last 1
+                  Write-Host ""
+                  Write-Host "Processing host: $hostName"
+                  
+                  try {
+                    # Get all user sessions using REST API
+                    $resourceId = $sessionHost.resourceId
+                    $apiVersion = "2023-09-05"
+                    $uri = "${resourceId}/userSessions?api-version=${apiVersion}"
+                    
+                    $sessionsResult = az rest --method GET --uri "$uri" 2>$null
+                    
+                    if ($LASTEXITCODE -eq 0 -and $sessionsResult) {
+                      $sessionsData = $sessionsResult | ConvertFrom-Json
+                      
+                      if ($sessionsData.value) {
+                        # Include both Active and Disconnected sessions
+                        $sessionsToTerminate = $sessionsData.value | Where-Object { 
+                          $_.properties.sessionState -eq 'Active' -or $_.properties.sessionState -eq 'Disconnected' 
+                        }
+                        
+                        if ($sessionsToTerminate.Count -gt 0) {
+                          Write-Host "Found $($sessionsToTerminate.Count) sessions to terminate (Active/Disconnected)"
+                          
+                          foreach ($session in $sessionsToTerminate) {
+                            $sessionId = $session.name -split "/" | Select-Object -Last 1
+                            $userPrincipalName = $session.properties.userPrincipalName
+                            $sessionState = $session.properties.sessionState
+                            Write-Host "  Terminating $sessionState session for user $userPrincipalName (Session: $sessionId)"
+                            
+                            try {
+                              # Use REST API to delete the session
+                              $deleteUri = "${resourceId}/userSessions/${sessionId}?api-version=${apiVersion}&force=true"
+                              $deleteResult = az rest --method DELETE --uri "$deleteUri" 2>&1
+                              
+                              if ($LASTEXITCODE -eq 0 -or $deleteResult -eq $null -or $deleteResult -eq "") {
+                                Write-Host "    ✅ Successfully terminated session"
+                                $totalLoggedOff++
+                              } else {
+                                # Double-check if the session is actually gone
+                                Start-Sleep -Seconds 2
+                                $checkUri = "${resourceId}/userSessions/${sessionId}?api-version=${apiVersion}"
+                                $checkResult = az rest --method GET --uri "$checkUri" 2>&1
+                                
+                                if ($checkResult -match "NotFound" -or $checkResult -match "404") {
+                                  Write-Host "    ✅ Session terminated (verified)"
+                                  $totalLoggedOff++
+                                } else {
+                                  Write-Host "    ❌ Failed to terminate session"
+                                  $totalFailed++
+                                }
+                              }
+                            } catch {
+                              Write-Host "    ❌ Error: $_"
+                              $totalFailed++
+                            }
+                          }
+                        } else {
+                          Write-Host "No active sessions on this host"
+                        }
+                      } else {
+                        Write-Host "No user sessions found on $hostName"
+                      }
+                    }
+                  } catch {
+                    Write-Host "##vso[task.logissue type=warning]Error retrieving sessions for $hostName $_"
+                  }
+                }
+                
+                Write-Host ""
+                Write-Host "##[section]Termination Summary"
+                Write-Host "✅ Successfully terminated: $totalLoggedOff sessions"
+                if ($totalFailed -gt 0) {
+                  Write-Host "⚠️ Could not confirm termination of: $totalFailed sessions"
+                  Write-Host "##vso[task.logissue type=warning]Could not confirm termination of $totalFailed sessions"
+                  
+                  if ($totalLoggedOff -eq 0 -and $totalFailed -gt 5) {
+                    Write-Host "##vso[task.logissue type=error]Failed to terminate all sessions"
+                    exit 1
+                  } else {
+                    Write-Host "Proceeding with shutdown as sessions appear to be cleared"
+                  }
+                }
+
+  - stage: ShutdownAndDeallocateHosts_${{ parameters.deploymentIdentifier }}
+    displayName: "Shutdown and Deallocate Target Hosts"
+    condition: and(succeeded(), eq(variables.isReplaceOperation, true))
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - RetrieveExistingResources_${{ parameters.deploymentIdentifier }}
+      - LogoffUsers_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      hostpoolresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolresourcegroup'] ]
+      hostsresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostsresourcegroup'] ]
+      hostsToProcess: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.hostsToProcess'] ]
+    jobs:
+      - job: ShutdownHosts
+        displayName: 'Shutdown VMs'
+        steps:
+          - task: PowerShell@2
+            displayName: "Parse VM Names from Hosts"
+            name: parseVMs
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Parsing host information"
+                $hostsJson = '$(hostsToProcess)'
+                Write-Host "Raw JSON length: $($hostsJson.Length)"
+                
+                $hosts = $hostsJson | ConvertFrom-Json
+                Write-Host "Found $($hosts.Count) hosts to process"
+                
+                $vmNamesList = @()
+                foreach ($sessionHost in $hosts) {
+                    $fullName = $sessionHost.name
+                    $parts = $fullName -split "/"
+                    $hostName = $parts[$parts.Length - 1]
+                    $vmName = $hostName -split "\." | Select-Object -First 1
+                    Write-Host "Extracted VM name: $vmName"
+                    $vmNamesList += $vmName
+                }
+                
+                $vmNamesString = $vmNamesList -join ","
+                Write-Host "VM names to process: $vmNamesString"
+                Write-Host "##vso[task.setvariable variable=vmList]$vmNamesString"
+
+          - task: AzureCLI@2
+            displayName: "Stop VMs"
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "Stopping VMs in resource group: $(hostsresourcegroup)"
+                $vmList = "$(vmList)"
+                
+                if ([string]::IsNullOrEmpty($vmList)) {
+                    Write-Host "No VMs to process"
+                    exit 0
+                }
+                
+                $VMS = $vmList -split ","
+                
+                foreach ($vm in $VMS) {
+                    Write-Host "Stopping VM: $vm"
+                    az vm stop --resource-group "$(hostsresourcegroup)" --name "$vm" --no-wait 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Host "  Stop command sent successfully"
+                    } else {
+                        Write-Host "  Warning: VM may already be stopped or doesn't exist"
+                    }
+                }
+                
+                Write-Host "Waiting 30 seconds for stop operations"
+                Start-Sleep -Seconds 30
+                
+                # Explicitly exit with success
+                exit 0
+
+          - task: AzureCLI@2
+            displayName: "Deallocate VMs"
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "Deallocating VMs in resource group: $(hostsresourcegroup)"
+                $vmList = "$(vmList)"
+                
+                if ([string]::IsNullOrEmpty($vmList)) {
+                    Write-Host "No VMs to process"
+                    exit 0
+                }
+                
+                $VMS = $vmList -split ","
+                
+                foreach ($vm in $VMS) {
+                    Write-Host "Deallocating VM: $vm"
+                    az vm deallocate --resource-group "$(hostsresourcegroup)" --name "$vm" --no-wait 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Host "  Deallocate command sent successfully"
+                    } else {
+                        Write-Host "  Warning: VM may already be deallocated or doesn't exist"
+                    }
+                }
+                
+                Write-Host "Waiting 60 seconds for deallocation operations"
+                Start-Sleep -Seconds 60
+                
+                # Explicitly exit with success
+                exit 0
+
+          - task: AzureCLI@2
+            displayName: "Verify and Output VM Names"
+            name: shutdownHosts
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "Verifying VM states and collecting names"
+                $vmList = "$(vmList)"
+                
+                if ([string]::IsNullOrEmpty($vmList)) {
+                    Write-Host "##vso[task.setvariable variable=vmNames;isOutput=true][]"
+                    exit 0
+                }
+                
+                $VMS = $vmList -split ","
+                $existingVMs = @()
+                
+                foreach ($vm in $VMS) {
+                    Write-Host "Checking VM: $vm"
+                    
+                    # Check if VM exists
+                    $vmExists = $null
+                    $vmExists = az vm show --resource-group "$(hostsresourcegroup)" --name "$vm" --query "name" -o tsv 2>$null
+                    
+                    if (-not [string]::IsNullOrEmpty($vmExists)) {
+                        Write-Host "  VM exists: $vm"
+                        
+                        # Get power state
+                        $powerState = $null
+                        $powerState = az vm show --resource-group "$(hostsresourcegroup)" --name "$vm" --show-details --query "powerState" -o tsv 2>$null
+                        if ([string]::IsNullOrEmpty($powerState)) {
+                            $powerState = "unknown"
+                        }
+                        Write-Host "  Power state: $powerState"
+                        
+                        $existingVMs += $vm
+                    }
+                    else {
+                        Write-Host "  VM does not exist: $vm"
+                    }
+                }
+                
+                # Create JSON array
+                if ($existingVMs.Count -gt 0) {
+                    $vmNamesJson = $existingVMs | ConvertTo-Json -Compress
+                    if ($existingVMs.Count -eq 1) {
+                        # ConvertTo-Json doesn't create an array for single items
+                        $vmNamesJson = "[$vmNamesJson]"
+                    }
+                }
+                else {
+                    $vmNamesJson = "[]"
+                }
+                
+                Write-Host "VM names JSON: $vmNamesJson"
+                Write-Host "##vso[task.setvariable variable=vmNames;isOutput=true]$vmNamesJson"
+                
+                Write-Host "Shutdown and deallocation completed"
+                
+                # Explicitly exit with success
+                exit 0
+
+  - stage: ChangeDiskType_${{ parameters.deploymentIdentifier }}
+    displayName: "Change OS Disks to Standard HDD"
+    condition: and(succeeded(), eq(variables.isReplaceOperation, true))
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - ShutdownAndDeallocateHosts_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      hostpoolresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolresourcegroup'] ]
+      hostsresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostsresourcegroup'] ]
+      vmNames: $[ stageDependencies.ShutdownAndDeallocateHosts_${{ parameters.deploymentIdentifier }}.ShutdownHosts.outputs['shutdownHosts.vmNames'] ]
+    jobs:
+      - job: ChangeDiskType
+        displayName: 'Optimize Disk Costs'
+        continueOnError: true
+        steps:
+          - task: AzureCLI@2
+            displayName: "Change OS Disk Type to Standard HDD"
+            continueOnError: true
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "##[section]Changing OS disk type to Standard_LRS for cost optimization"
+                Write-Host "Note: This may fail if the service principal lacks cross-subscription permissions"
+                Write-Host ""
+                
+                $vmNamesJson = '$(vmNames)'
+                
+                # Check if we have any VMs to process
+                if ([string]::IsNullOrEmpty($vmNamesJson)) {
+                    Write-Host "##[warning]No VMs to process"
+                    exit 0
+                }
+                
+                if ($vmNamesJson -eq '[]') {
+                    Write-Host "##[warning]Empty VM array"
+                    exit 0
+                }
+                
+                # Parse VM names
+                $vmNames = @()
+                try {
+                    $vmNames = $vmNamesJson | ConvertFrom-Json
+                } catch {
+                    Write-Host "##[warning]Failed to parse VM names JSON"
+                    exit 0
+                }
+                
+                if ($vmNames.Count -eq 0) {
+                    Write-Host "##[warning]No VMs in array"
+                    exit 0
+                }
+                
+                Write-Host "Processing $($vmNames.Count) VMs for disk optimization"
+                
+                $successCount = 0
+                $alreadyOptimalCount = 0
+                $failCount = 0
+                
+                foreach ($vmName in $vmNames) {
+                    Write-Host ""
+                    Write-Host "Processing VM: $vmName"
+                    
+                    # Verify VM is deallocated before changing disk type
+                    $powerState = az vm show --resource-group "$(hostsresourcegroup)" --name $vmName --show-details --query "powerState" -o tsv 2>$null
+                    if ($powerState -and $powerState -ne "VM deallocated") {
+                        Write-Host "  [SKIP] VM power state is '$powerState' - must be deallocated to change disk type"
+                        $failCount++
+                        continue
+                    }
+                    
+                    # Get OS disk name
+                    $osDiskName = az vm show --resource-group "$(hostsresourcegroup)" --name $vmName --query "storageProfile.osDisk.name" -o tsv 2>$null
+                    
+                    if ([string]::IsNullOrEmpty($osDiskName)) {
+                        Write-Host "  [FAIL] Could not find OS disk for VM"
+                        $failCount++
+                        continue
+                    }
+                    
+                    Write-Host "  OS Disk: $osDiskName"
+                    
+                    # Get current disk type
+                    $currentSku = az disk show --resource-group "$(hostsresourcegroup)" --name $osDiskName --query "sku.name" -o tsv 2>$null
+                    Write-Host "  Current disk type: $currentSku"
+                    
+                    # Determine target SKU based on current disk redundancy
+                    # ZRS disks cannot be directly changed to LRS - Azure does not support cross-redundancy SKU changes
+                    # For ZRS disks: StandardSSD_ZRS is already the cheapest ZRS tier, skip
+                    # For LRS disks: downgrade to Standard_LRS (Standard HDD) for cost savings
+                    $isZrs = $currentSku -like "*_ZRS"
+                    
+                    if ($isZrs) {
+                        # StandardSSD_ZRS is already the cheapest ZRS tier available
+                        # Premium_ZRS -> StandardSSD_ZRS is the only useful downgrade
+                        if ($currentSku -eq "StandardSSD_ZRS") {
+                            Write-Host "  [OK] Disk is already StandardSSD_ZRS (cheapest ZRS tier) - no downgrade possible"
+                            $alreadyOptimalCount++
+                            continue
+                        }
+                        $targetSku = "StandardSSD_ZRS"
+                    } else {
+                        # LRS disks: downgrade to Standard_LRS (Standard HDD)
+                        if ($currentSku -eq "Standard_LRS") {
+                            Write-Host "  [OK] Disk is already Standard_LRS (cheapest tier)"
+                            $alreadyOptimalCount++
+                            continue
+                        }
+                        $targetSku = "Standard_LRS"
+                    }
+                    
+                    # Try to change disk type
+                    Write-Host "  Changing disk type from $currentSku to $targetSku..."
+                    $output = az disk update --resource-group "$(hostsresourcegroup)" --name $osDiskName --set sku.name=$targetSku 2>&1
+                    
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Host "  [OK] Successfully changed disk type to $targetSku"
+                        $successCount++
+                    } else {
+                        $errorMsg = ($output | Out-String).Trim()
+                        if ($errorMsg -match "LinkedAuthorizationFailed") {
+                            Write-Host "  [WARN] Permission issue: Service principal lacks cross-subscription gallery access"
+                            Write-Host "  This is expected when disks are created from images in another subscription"
+                        } else {
+                            Write-Host "  [FAIL] Failed to change disk type"
+                            Write-Host "  Error: $errorMsg"
+                        }
+                        $failCount++
+                    }
+                }
+                
+                Write-Host ""
+                Write-Host "##[section]Disk Optimization Summary"
+                Write-Host "Successfully changed: $successCount disks"
+                Write-Host "Already optimal: $alreadyOptimalCount disks"
+                if ($failCount -gt 0) {
+                    Write-Host "Could not change: $failCount disks"
+                    Write-Host ""
+                    Write-Host "##[warning]Some disks could not be changed."
+                    Write-Host "##[warning]The deployment will continue with existing disk types."
+                }
+                
+                # Always exit with success to allow pipeline to continue
+                exit 0
+
+  # NOTE: CleanupAVDDevices stage is temporarily disabled - the device cleanup
+  #       service connection is not yet working correctly.
+  # # Cleanup stale Entra ID and Intune device objects before deploying new session hosts
+  # - stage: CleanupAVDDevices_${{ parameters.deploymentIdentifier }}
+  #   displayName: "Cleanup AVD Devices in Entra ID and Intune"
+  #   dependsOn:
+  #     - InitializeParameters_${{ parameters.deploymentIdentifier }}
+  #     - RetrieveExistingResources_${{ parameters.deploymentIdentifier }}
+  #   variables:
+  #     hostsToProcess: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.hostsToProcess'] ]
+  #     vmNamePrefix: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.vmNamePrefix'] ]
+  #     startingHostNumber: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.startingHostNumber'] ]
+  #     additionalHostCount: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.additionalHostCount'] ]
+  #     operationType: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.operationType'] ]
+  #   jobs:
+  #     - job: ValidateCleanup
+  #       displayName: 'Validate Devices to Cleanup (Dry Run)'
+  #       steps:
+  #         - task: PowerShell@2
+  #           displayName: 'Install Required PowerShell Modules'
+  #           inputs:
+  #             targetType: 'inline'
+  #             script: |
+  #               Write-Host "##[section]Installing Microsoft Graph PowerShell modules..."
+  #               $modules = @(
+  #                 'Microsoft.Graph.Authentication',
+  #                 'Microsoft.Graph.Identity.DirectoryManagement',
+  #                 'Microsoft.Graph.DeviceManagement',
+  #                 'Microsoft.Graph.Groups'
+  #               )
+  #               foreach ($module in $modules) {
+  #                 Write-Host "Installing $module..."
+  #                 Install-Module $module -Force -Scope CurrentUser -ErrorAction Stop
+  #               }
+  #               Write-Host "✅ All modules installed successfully"
+  #
+  #         - task: PowerShell@2
+  #           displayName: 'Compute Device Names'
+  #           name: computeDeviceNames
+  #           inputs:
+  #             targetType: 'inline'
+  #             pwsh: true
+  #             script: |
+  #               $operationType = "$(operationType)"
+  #               $deploymentActivation = "${{ parameters.DeploymentActivation }}".ToLower()
+  #               
+  #               Write-Host "##[section]Computing device names for cleanup"
+  #               Write-Host "Operation type: $operationType"
+  #               Write-Host "Deployment activation: $deploymentActivation"
+  #               
+  #               $deviceNames = @()
+  #               
+  #               if ($operationType -eq 'replace') {
+  #                   # For replace operations: extract VM names from hostsToProcess
+  #                   $hostsJson = '$(hostsToProcess)'
+  #                   Write-Host "Hosts to process JSON: $hostsJson"
+  #                   
+  #                   if (-not [string]::IsNullOrEmpty($hostsJson) -and $hostsJson -ne '[]') {
+  #                       $hosts = $hostsJson | ConvertFrom-Json
+  #                       foreach ($h in $hosts) {
+  #                           # name format is "hostpool/hostname.domain" - extract just the computer name
+  #                           $fullName = $h.name -split "/" | Select-Object -Last 1
+  #                           $computerName = $fullName -replace '\..*$', ''
+  #                           $deviceNames += $computerName
+  #                       }
+  #                   }
+  #                   
+  #                   Write-Host "Replace operation - found $($deviceNames.Count) hosts to clean up"
+  #               } else {
+  #                   # For add operations: compute names from prefix + activation + starting number
+  #                   $vmNamePrefix = "$(vmNamePrefix)"
+  #                   $startingNumber = [int]"$(startingHostNumber)"
+  #                   $hostCount = [int]"$(additionalHostCount)"
+  #                   $vmNamePrefixWithActivation = "${vmNamePrefix}-${deploymentActivation}"
+  #                   
+  #                   Write-Host "VM Name Prefix: $vmNamePrefixWithActivation"
+  #                   Write-Host "Starting number: $startingNumber"
+  #                   Write-Host "Host count: $hostCount"
+  #                   
+  #                   for ($i = 0; $i -lt $hostCount; $i++) {
+  #                       $vmNumber = $startingNumber + $i
+  #                       $deviceNames += "${vmNamePrefixWithActivation}-$('{0:d2}' -f $vmNumber)"
+  #                   }
+  #                   
+  #                   Write-Host "Add operation - computed $($deviceNames.Count) device names"
+  #               }
+  #               
+  #               if ($deviceNames.Count -eq 0) {
+  #                   Write-Host "##[warning]No device names to clean up"
+  #                   Write-Host "##vso[task.setvariable variable=deviceNamesList;isOutput=true]"
+  #                   Write-Host "##vso[task.setvariable variable=hasDevices;isOutput=true]false"
+  #                   exit 0
+  #               }
+  #               
+  #               Write-Host ""
+  #               Write-Host "##[section]Devices to clean up:"
+  #               foreach ($name in $deviceNames) {
+  #                   Write-Host "  - $name"
+  #               }
+  #               
+  #               $deviceNamesString = $deviceNames -join ','
+  #               Write-Host "##vso[task.setvariable variable=deviceNamesList;isOutput=true]$deviceNamesString"
+  #               Write-Host "##vso[task.setvariable variable=hasDevices;isOutput=true]true"
+  #
+  #         # Uses a dedicated service connection with Microsoft Graph API permissions:
+  #         #   - Device.ReadWrite.All
+  #         #   - DeviceManagementManagedDevices.ReadWrite.All
+  #         #   - GroupMember.Read.All
+  #         # The 'addSpnToEnvironment' flag exposes the SPN credentials as env vars:
+  #         #   $env:servicePrincipalId, $env:servicePrincipalKey, $env:tenantId
+  #         - task: AzureCLI@2
+  #           displayName: 'Validate Devices (Dry Run)'
+  #           condition: eq(variables['computeDeviceNames.hasDevices'], 'true')
+  #           inputs:
+  #             azureSubscription: '${{ parameters.serviceConnection }}'
+  #             scriptType: 'ps'
+  #             scriptLocation: 'inlineScript'
+  #             addSpnToEnvironment: true
+  #             inlineScript: |
+  #               $deviceNamesString = "$(computeDeviceNames.deviceNamesList)"
+  #               $deviceNamesArray = $deviceNamesString -split ','
+  #               
+  #               Write-Host "##[section]Running cleanup validation (dry run) for $($deviceNamesArray.Count) devices..."
+  #               Write-Host "Using service principal: $env:servicePrincipalId"
+  #               
+  #               $clientSecret = ConvertTo-SecureString $env:servicePrincipalKey -AsPlainText -Force
+  #               
+  #               & "$(Build.SourcesDirectory)/Scripts/AVD-CleanupEntraIntuneDevices.ps1" `
+  #                   -DeviceNames $deviceNamesArray `
+  #                   -TenantId $env:tenantId `
+  #                   -ClientId $env:servicePrincipalId `
+  #                   -ClientSecret $clientSecret `
+  #                   -AllowedGroupName "avd-sg-sessionhosts" `
+  #                   -ValidateOnly
+  #
+  #     - job: ApproveCleanup
+  #       displayName: 'Approve Device Cleanup'
+  #       dependsOn: ValidateCleanup
+  #       condition: eq(dependencies.ValidateCleanup.outputs['computeDeviceNames.hasDevices'], 'true')
+  #       pool: server
+  #       steps:
+  #         - task: ManualValidation@0
+  #           displayName: 'Approve Actual Deletion'
+  #           timeoutInMinutes: 60
+  #           inputs:
+  #             instructions: |
+  #               Review the output of the "Validate Devices (Dry Run)" step in the previous job.
+  #               Approve to proceed with actual deletion of the listed Entra ID and Intune device objects.
+  #               This cleanup prevents duplicate device registrations when new session hosts are deployed.
+  #
+  #     - job: ExecuteCleanup
+  #       displayName: 'Delete Stale Device Objects'
+  #       dependsOn: ApproveCleanup
+  #       variables:
+  #         deviceNamesList: $[ dependencies.ValidateCleanup.outputs['computeDeviceNames.deviceNamesList'] ]
+  #         hasDevices: $[ dependencies.ValidateCleanup.outputs['computeDeviceNames.hasDevices'] ]
+  #       condition: eq(dependencies.ValidateCleanup.outputs['computeDeviceNames.hasDevices'], 'true')
+  #       steps:
+  #         - task: PowerShell@2
+  #           displayName: 'Install Required PowerShell Modules'
+  #           inputs:
+  #             targetType: 'inline'
+  #             script: |
+  #               Write-Host "##[section]Installing Microsoft Graph PowerShell modules..."
+  #               $modules = @(
+  #                 'Microsoft.Graph.Authentication',
+  #                 'Microsoft.Graph.Identity.DirectoryManagement',
+  #                 'Microsoft.Graph.DeviceManagement',
+  #                 'Microsoft.Graph.Groups'
+  #               )
+  #               foreach ($module in $modules) {
+  #                 Write-Host "Installing $module..."
+  #                 Install-Module $module -Force -Scope CurrentUser -ErrorAction Stop
+  #               }
+  #               Write-Host "✅ All modules installed successfully"
+  #
+  #         - task: AzureCLI@2
+  #           displayName: 'Delete Devices (Actual Run)'
+  #           inputs:
+  #             azureSubscription: '${{ parameters.serviceConnection }}'
+  #             scriptType: 'ps'
+  #             scriptLocation: 'inlineScript'
+  #             addSpnToEnvironment: true
+  #             inlineScript: |
+  #               $deviceNamesString = "$(deviceNamesList)"
+  #               $deviceNamesArray = $deviceNamesString -split ','
+  #               
+  #               Write-Host "##[section]Executing cleanup for $($deviceNamesArray.Count) devices..."
+  #               Write-Host "Using service principal: $env:servicePrincipalId"
+  #               
+  #               $clientSecret = ConvertTo-SecureString $env:servicePrincipalKey -AsPlainText -Force
+  #               
+  #               & "$(Build.SourcesDirectory)/Scripts/AVD-CleanupEntraIntuneDevices.ps1" `
+  #                   -DeviceNames $deviceNamesArray `
+  #                   -TenantId $env:tenantId `
+  #                   -ClientId $env:servicePrincipalId `
+  #                   -ClientSecret $clientSecret `
+  #                   -AllowedGroupName "avd-sg-sessionhosts" `
+  #                   -Force
+
+  # Deploy new hosts stage (for both add and replace operations)
+  - stage: DeployNewSessionHosts_${{ parameters.deploymentIdentifier }}
+    displayName: "Deploy New Session Hosts"
+    condition: not(failed())
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - RetrieveExistingResources_${{ parameters.deploymentIdentifier }}
+      # - CleanupAVDDevices_${{ parameters.deploymentIdentifier }}  # Temporarily disabled
+      - ${{ if eq(parameters.operationType, 'replace') }}:
+        - ChangeDiskType_${{ parameters.deploymentIdentifier }}
+      - ${{ if eq(parameters.confidentialCompute, true) }}:
+        - RegisterCCFeatures_${{ parameters.deploymentIdentifier }}
+      - ${{ if and(eq(parameters.confidentialCompute, true), eq(parameters.customerManagedKeys, true)) }}:
+        - DeployDiskEncryptionSet_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      location: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.location'] ]
+      vmLocation: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.vmLocation'] ]
+      hostpoolname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolname'] ]
+      hostpoolresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolresourcegroup'] ]
+      hostsresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostsresourcegroup'] ]
+      vmSize: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.vmSize'] ]
+      vmNamePrefix: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.vmNamePrefix'] ]
+      subnetId: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subnetId'] ]
+      DomainJoinKeyVaultID: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.DomainJoinKeyVaultID'] ]
+      startingHostNumber: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.startingHostNumber'] ]
+      additionalHostCount: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.additionalHostCount'] ]
+      operationType: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.operationType'] ]
+      hostPoolId: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.hostPoolId'] ]
+      keyVaultId: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.keyVaultId'] ]
+      managedIdentityId: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.managedIdentityId'] ]
+      dataCollectionRuleId: $[ stageDependencies.RetrieveExistingResources_${{ parameters.deploymentIdentifier }}.RetrieveResources.outputs['existingResources.dataCollectionRuleId'] ]
+      SharedImageId: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.SharedImageId'] ]
+      imagePublisher: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.imagePublisher'] ]
+      imageOffer: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.imageOffer'] ]
+      imageSku: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.imageSku'] ]
+      imageVersion: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.imageVersion'] ]
+      confidentialCompute: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.confidentialCompute'] ]
+      customerManagedKeys: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.customerManagedKeys'] ]
+      domainJoinType: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.domainJoinType'] ]
+      isEntraJoin: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.isEntraJoin'] ]
+      diskEncryptionSetId: $[ stageDependencies.DeployDiskEncryptionSet_${{ parameters.deploymentIdentifier }}.Deploy.outputs['deployDES.diskEncryptionSetId'] ]
+    jobs:
+      - job: Deploy
+        displayName: 'Deploy VMs'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Generate Host Pool Registration Token"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+                
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "##[section]Generating registration token for host pool: $(hostpoolname)"
+                
+                # Calculate expiration time (24 hours from now)
+                $expirationTime = (Get-Date).AddHours(24).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                
+                Write-Host "Token expiration time: $expirationTime"
+                
+                # Update the host pool with a new registration token using REST API
+                Write-Host "Generating new registration token using REST API..."
+                
+                $subscriptionId = az account show --query "id" -o tsv 2>$null
+                if (-not $subscriptionId) {
+                    $subscriptionId = "$(subscriptionname)"
+                }
+                
+                $apiVersion = "2023-09-05"
+                $hostPoolUri = "https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/$(hostpoolresourcegroup)/providers/Microsoft.DesktopVirtualization/hostPools/$(hostpoolname)?api-version=${apiVersion}"
+                
+                $body = @{
+                    properties = @{
+                        registrationInfo = @{
+                            expirationTime = $expirationTime
+                            registrationTokenOperation = "Update"
+                        }
+                    }
+                } | ConvertTo-Json -Depth 10
+                
+                $tempBodyFile = [System.IO.Path]::GetTempFileName()
+                [System.IO.File]::WriteAllText($tempBodyFile, $body)
+                
+                $null = az rest --method PATCH --uri "$hostPoolUri" --body "@$tempBodyFile" 2>$null
+                
+                Remove-Item $tempBodyFile -Force -ErrorAction SilentlyContinue
+                
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to generate registration token"
+                  exit 1
+                } else {
+                  Write-Host "Successfully generated new registration token"
+                }
+                
+                # Wait a moment for the token to be ready
+                Start-Sleep -Seconds 5
+                
+          - task: AzureCLI@2
+            displayName: "Cleanup Existing VMs from Failed Deployment"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              failOnStandardError: false
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                
+                az account set --subscription $(subscriptionname)
+                
+                $deploymentActivation = "${{ parameters.DeploymentActivation }}".ToLower()
+                $originalVmNamePrefix = "$(vmNamePrefix)"
+                $vmNamePrefixWithActivation = "${originalVmNamePrefix}-${deploymentActivation}"
+                $startingNumber = [int]"$(startingHostNumber)"
+                $hostCount = [int]"$(additionalHostCount)"
+                $rg = "$(hostsresourcegroup)"
+                
+                Write-Host "##[section]Checking for existing VMs from previous failed deployment"
+                Write-Host "Resource Group: $rg"
+                Write-Host "VM Name Prefix: $vmNamePrefixWithActivation"
+                
+                # Check if resource group exists first
+                $rgExists = az group exists --name $rg --output tsv 2>$null
+                if ($rgExists -ne "true") {
+                    Write-Host "Resource group '$rg' does not exist yet - nothing to clean up"
+                    exit 0
+                }
+                
+                # Build list of expected VM names
+                $expectedVMs = @()
+                for ($i = 0; $i -lt $hostCount; $i++) {
+                    $vmNumber = $startingNumber + $i
+                    $expectedVMs += "${vmNamePrefixWithActivation}$('{0:d2}' -f $vmNumber)"
+                }
+                
+                Write-Host "Checking for VMs: $($expectedVMs -join ', ')"
+                
+                # Get existing VMs that match our target names
+                $existingVMs = az vm list --resource-group $rg --query "[?starts_with(name, '$vmNamePrefixWithActivation')].{name:name, provisioningState:provisioningState}" --output json 2>$null | ConvertFrom-Json
+                
+                if (-not $existingVMs -or $existingVMs.Count -eq 0) {
+                    Write-Host "[OK] No existing VMs found with prefix '$vmNamePrefixWithActivation' - clean deployment"
+                    exit 0
+                }
+                
+                Write-Host "[WARNING] Found $($existingVMs.Count) existing VM(s) from a previous deployment attempt:"
+                foreach ($vm in $existingVMs) {
+                    Write-Host "  - $($vm.name) (provisioning: $($vm.provisioningState))"
+                }
+                
+                # Delete VMs, their OS disks, NICs, and remove from host pool
+                Write-Host ""
+                Write-Host "##[section]Deleting existing VMs, disks, and NICs to allow clean redeployment..."
+                
+                foreach ($vm in $existingVMs) {
+                    $vmName = $vm.name
+                    Write-Host ""
+                    Write-Host "--- Processing $vmName ---"
+                    
+                    # Get VM details (OS disk, NICs) before deleting
+                    $vmDetail = az vm show --resource-group $rg --name $vmName --output json 2>$null | ConvertFrom-Json
+                    
+                    $osDiskName = $null
+                    $nicIds = @()
+                    
+                    if ($vmDetail) {
+                        $osDiskName = $vmDetail.storageProfile.osDisk.name
+                        if ($vmDetail.networkProfile.networkInterfaces) {
+                            $nicIds = $vmDetail.networkProfile.networkInterfaces | ForEach-Object { $_.id }
+                        }
+                        Write-Host "  OS Disk: $osDiskName"
+                        Write-Host "  NICs: $($nicIds.Count)"
+                    }
+                    
+                    # Delete the VM (this does NOT delete the disk or NIC by default)
+                    Write-Host "  Deleting VM $vmName..."
+                    az vm delete --resource-group $rg --name $vmName --yes --force-deletion true --no-wait false 2>$null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Host "  [OK] VM deleted"
+                    } else {
+                        Write-Host "  ##[warning]Failed to delete VM $vmName (exit code: $LASTEXITCODE)"
+                    }
+                    
+                    # Remove session host registration from the host pool
+                    Write-Host "  Removing session host from host pool $(hostpoolname)..."
+                    try {
+                        $subscriptionId = az account show --query "id" -o tsv 2>$null
+                        $apiVersion = "2023-09-05"
+                        $sessionHostsUri = "https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/$(hostpoolresourcegroup)/providers/Microsoft.DesktopVirtualization/hostPools/$(hostpoolname)/sessionHosts?api-version=${apiVersion}"
+                        
+                        $allHosts = az rest --method GET --uri "$sessionHostsUri" -o json 2>$null | ConvertFrom-Json
+                        
+                        # Find the session host matching this VM name (session host name format: hostpool/vmname.domain)
+                        $matchingHost = $allHosts.value | Where-Object {
+                            $shName = $_.name -split "/" | Select-Object -Last 1
+                            $shVmName = ($shName -split "\.")[0]
+                            $shVmName -eq $vmName
+                        }
+                        
+                        if ($matchingHost) {
+                            $sessionHostName = $matchingHost.name -split "/" | Select-Object -Last 1
+                            $deleteUri = "$($matchingHost.id)?api-version=${apiVersion}"
+                            az rest --method DELETE --uri "$deleteUri" 2>$null
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Host "  [OK] Session host '$sessionHostName' removed from host pool"
+                            } else {
+                                Write-Host "  ##[warning]Failed to remove session host '$sessionHostName' from host pool (exit code: $LASTEXITCODE)"
+                            }
+                        } else {
+                            Write-Host "  [INFO] No matching session host found in host pool for '$vmName' - skipping"
+                        }
+                    } catch {
+                        Write-Host "  ##[warning]Error removing session host from host pool: $_"
+                    }
+                    
+                    # Delete the OS disk
+                    if ($osDiskName) {
+                        Write-Host "  Deleting OS disk $osDiskName..."
+                        az disk delete --resource-group $rg --name $osDiskName --yes --no-wait false 2>$null
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Host "  [OK] OS disk deleted"
+                        } else {
+                            Write-Host "  ##[warning]Failed to delete disk $osDiskName (exit code: $LASTEXITCODE)"
+                        }
+                    }
+                    
+                    # Delete NICs
+                    foreach ($nicId in $nicIds) {
+                        $nicName = ($nicId -split '/')[-1]
+                        Write-Host "  Deleting NIC $nicName..."
+                        az network nic delete --ids $nicId 2>$null
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Host "  [OK] NIC deleted"
+                        } else {
+                            Write-Host "  ##[warning]Failed to delete NIC $nicName (exit code: $LASTEXITCODE)"
+                        }
+                    }
+                    
+                    Write-Host "  [OK] Cleanup complete for $vmName"
+                }
+                
+                Write-Host ""
+                Write-Host "[OK] All existing VMs cleaned up - deployment can proceed with fresh resources"
+                
+                exit 0
+                
+          - task: AzureCLI@2
+            displayName: "Deploy New Session Hosts"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              failOnStandardError: false
+              inlineScript: |
+                az account set --subscription $(subscriptionname)
+                
+                $operationType = "$(operationType)"
+                $deploymentActivation = "${{ parameters.DeploymentActivation }}".ToLower()
+                $startingNumber = [int]"$(startingHostNumber)"
+                $hostCount = [int]"$(additionalHostCount)"
+                $isConfidentialCompute = "$(confidentialCompute)" -eq "True"
+                
+                Write-Host "##[section]Deploying $operationType Session Hosts"
+                Write-Host "Deployment Activation: ${{ parameters.DeploymentActivation }}"
+                Write-Host "Host Count: $hostCount"
+                Write-Host "Host Pool: $(hostpoolname)"
+                Write-Host "Confidential Compute: $isConfidentialCompute"
+                
+                # Create VM name prefix with deployment activation
+                $originalVmNamePrefix = "$(vmNamePrefix)"
+                $vmNamePrefixWithActivation = "${originalVmNamePrefix}-${deploymentActivation}"
+                
+                Write-Host "Original VM Name Prefix: $originalVmNamePrefix"
+                Write-Host "VM Name Prefix with Activation: $vmNamePrefixWithActivation"
+                Write-Host "Starting Number: $startingNumber"
+                Write-Host "VM Size: $(vmSize)"
+                Write-Host "Shared Image ID: $(SharedImageId)"
+                
+                $sharedImageIdValue = "$(SharedImageId)"
+                if ([string]::IsNullOrEmpty($sharedImageIdValue)) {
+                  Write-Host "Image Source: Marketplace ($(imagePublisher)/$(imageOffer)/$(imageSku)/$(imageVersion))"
+                } else {
+                  Write-Host "Image Source: Shared Image Gallery"
+                }
+                
+                # Select the appropriate template and parameter file based on confidential compute setting
+                if ($isConfidentialCompute) {
+                  Write-Host "##[section]Using Confidential Compute template"
+                  $templatefile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/AzureVirtualDesktop/SessionHost/main-cc.bicep"
+                  $parameterfile = "$(System.DefaultWorkingDirectory)/Environments/$(subscriptionname)/$(hostpoolname)/SessionHost/main-cc.parameters.json"
+                  
+                  # Fall back to component library parameter file if environment-specific one doesn't exist
+                  if (-not (Test-Path $parameterfile)) {
+                    Write-Host "Environment-specific CC parameter file not found, using component library defaults"
+                    $parameterfile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/AzureVirtualDesktop/SessionHost/main-cc.parameters.json"
+                  }
+                } else {
+                  Write-Host "##[section]Using Standard (Trusted Launch) template"
+                  $templatefile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/AzureVirtualDesktop/SessionHost/main.bicep"
+                  $parameterfile = "$(System.DefaultWorkingDirectory)/Environments/$(subscriptionname)/$(hostpoolname)/SessionHost/main.parameters.json"
+                }
+                
+                if (-not (Test-Path $templatefile)) {
+                  Write-Host "##vso[task.logissue type=error]Template file '$templatefile' not found."
+                  exit 1
+                }
+                
+                if (-not (Test-Path $parameterfile)) {
+                  Write-Host "##vso[task.logissue type=error]Parameter file not found at: $parameterfile"
+                  Write-Host "This file is required as it contains KeyVault secret names and other deployment settings."
+                  exit 1
+                }
+                
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                
+                # Get timestamp for tags
+                $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                $deploymentId = "$(Build.BuildId)"
+                
+                Write-Host "Reading parameters from existing file..."
+                $existingParams = Get-Content $parameterfile -Raw | ConvertFrom-Json
+                
+                # Build deployment parameters
+                $deploymentParams = @{}
+                
+                # Copy ALL parameters from the existing file
+                foreach ($param in $existingParams.parameters.PSObject.Properties) {
+                  $paramName = $param.Name
+                  $paramValue = $param.Value.value
+                  $deploymentParams[$paramName] = $paramValue
+                }
+                
+                # Override specific parameters
+                $deploymentParams["hostpoolName"] = "$(hostpoolname)"
+                $deploymentParams["hostpoolResourceGroup"] = "$(hostpoolresourcegroup)"
+                $deploymentParams["location"] = "$(vmLocation)"
+                $deploymentParams["sessionHostCount"] = $hostCount
+                $deploymentParams["startingIndex"] = $startingNumber
+                $deploymentParams["vmSize"] = "$(vmSize)"
+                $deploymentParams["vmNamePrefix"] = $vmNamePrefixWithActivation
+                $deploymentParams["subnetId"] = "$(subnetId)"
+                $deploymentParams["userAssignedIdentityId"] = "$(managedIdentityId)"
+                $deploymentParams["DomainKeyVaultId"] = "$(DomainJoinKeyVaultID)"
+                $deploymentParams["LocalKeyVaultId"] = "$(keyVaultId)"
+                $deploymentParams["SharedImageId"] = "$(SharedImageId)"
+                
+                # Override marketplace image parameters from JSON config (used when SharedImageId is empty)
+                $deploymentParams["imagePublisher"] = "$(imagePublisher)"
+                $deploymentParams["imageOffer"] = "$(imageOffer)"
+                $deploymentParams["imageSku"] = "$(imageSku)"
+                $deploymentParams["imageVersion"] = "$(imageVersion)"
+                
+                # Override domain join type
+                $isEntraJoin = "$(isEntraJoin)"
+                $deploymentParams["AADJoin"] = ($isEntraJoin -eq 'true')
+                Write-Host "Domain Join Type: $(domainJoinType) (AADJoin = $($deploymentParams['AADJoin']))"
+                
+                # Add data collection rule if available
+                $dataCollectionRuleValue = "$(dataCollectionRuleId)"
+                if (-not [string]::IsNullOrEmpty($dataCollectionRuleValue)) {
+                  $deploymentParams["dataCollectionRuleId"] = $dataCollectionRuleValue
+                }
+                
+                # Add confidential compute specific parameters
+                if ($isConfidentialCompute) {
+                  $isCustomerManagedKeys = "$(customerManagedKeys)" -eq "True"
+                  Write-Host ""
+                  Write-Host "##[section]Confidential Compute Configuration"
+                  Write-Host "Customer-Managed Keys (CMK): $isCustomerManagedKeys"
+
+                  if ($isCustomerManagedKeys) {
+                    # CMK path: DiskWithVMGuestState + DES from Managed HSM
+                    $desId = "$(diskEncryptionSetId)"
+                    Write-Host "Disk Encryption Set ID: $desId"
+
+                    if ([string]::IsNullOrEmpty($desId)) {
+                      Write-Host "##vso[task.logissue type=error]Disk Encryption Set ID is empty. The DeployDiskEncryptionSet stage may have failed."
+                      exit 1
+                    }
+
+                    $deploymentParams["diskEncryptionSetId"] = $desId
+                    $deploymentParams["securityEncryptionType"] = "DiskWithVMGuestState"
+                    Write-Host "Security Encryption Type: DiskWithVMGuestState"
+                    Write-Host "Encryption Mode: Customer-Managed Keys (CMK)"
+                  } else {
+                    # PMK path: VMGuestStateOnly, no DES needed
+                    $deploymentParams["diskEncryptionSetId"] = ""
+                    $deploymentParams["securityEncryptionType"] = "VMGuestStateOnly"
+                    Write-Host "Security Encryption Type: VMGuestStateOnly"
+                    Write-Host "Encryption Mode: Platform-Managed Keys (PMK)"
+                    Write-Host "No Disk Encryption Set or Managed HSM required"
+                  }
+
+                  $deploymentParams["osDiskStorageAccountType"] = "Premium_LRS"
+                  Write-Host "OS Disk Storage Account Type: Premium_LRS"
+                }
+                
+                # Handle tags
+                if ($deploymentParams.ContainsKey('tags') -and $deploymentParams['tags'] -ne $null) {
+                  $tags = $deploymentParams['tags']
+                  if ($tags -is [PSObject]) {
+                    $newTags = @{}
+                    $tags.PSObject.Properties | ForEach-Object {
+                      $newTags[$_.Name] = $_.Value
+                    }
+                    $tags = $newTags
+                  }
+                } else {
+                  $tags = @{}
+                }
+                
+                # Add deployment metadata to tags
+                $tags["DeploymentTime"] = $timestamp
+                $tags["DeploymentId"] = $deploymentId
+                $tags["DeploymentType"] = $operationType
+                $tags["DeploymentActivation"] = "${{ parameters.DeploymentActivation }}"
+                $tags["BuildNumber"] = "$(Build.BuildNumber)"
+                $tags["RequestedBy"] = "$(Build.RequestedFor)"
+                $tags["StartingIndex"] = "$startingNumber"
+                $tags["RequestedCount"] = "$hostCount"
+                if ($isConfidentialCompute) {
+                  $tags["SecurityType"] = "ConfidentialVM"
+                } else {
+                  $tags["SecurityType"] = "TrustedLaunch"
+                }
+                $deploymentParams["tags"] = $tags
+                
+                Write-Host ""
+                Write-Host "##[section]DEPLOYMENT CONFIGURATION"
+                Write-Host "Operation: $operationType"
+                Write-Host "Deployment Activation: ${{ parameters.DeploymentActivation }}"
+                Write-Host "Subscription: $(subscriptionname)"
+                Write-Host "Host Pool Resource Group: $(hostpoolresourcegroup)"
+                Write-Host "Hosts Resource Group (VMs): $(hostsresourcegroup)"
+                Write-Host "Location (general): $(location)"
+                Write-Host "VM Location (session hosts): $(vmLocation)"
+                Write-Host "Session Host Count: $hostCount"
+                Write-Host "Starting at VM Number: $startingNumber"
+                Write-Host "Security Type: $(if ($isConfidentialCompute) { 'ConfidentialVM' } else { 'TrustedLaunch' })"
+                Write-Host "Domain Join Type: $(domainJoinType) (AADJoin = $($deploymentParams['AADJoin']))"
+                Write-Host ""
+                
+                # Create temporary parameter file
+                $tempParamFile = Join-Path $env:TEMP "$operationType-hosts-params-$(New-Guid).json"
+                
+                Write-Host "##[section]VMs to be created"
+                Write-Host "With vmNamePrefix '$vmNamePrefixWithActivation' starting at index ${startingNumber}:"
+                for ($i = 0; $i -lt $hostCount; $i++) {
+                  $vmNumber = $startingNumber + $i
+                  Write-Host "  - ${vmNamePrefixWithActivation}-$('{0:d2}' -f $vmNumber)"
+                }
+                
+                try {
+                  Write-Host ""
+                  Write-Host "##[section]Starting deployment..."
+                  
+                  # Upgrade Azure CLI to fix "content already consumed" bug in 2.77.0
+                  Write-Host "##[section]Upgrading Azure CLI to latest version..."
+                  $currentVersion = az version --query '\"azure-cli\"' -o tsv
+                  Write-Host "Current Azure CLI version: $currentVersion"
+                  
+                  # Use Azure CLI's embedded Python to upgrade itself
+                  $azCliPath = "C:\Program Files\Microsoft SDKs\Azure\CLI2"
+                  $pythonPath = "$azCliPath\python.exe"
+                  
+                  if (Test-Path $pythonPath) {
+                    Write-Host "Upgrading Azure CLI using embedded Python..."
+                    & $pythonPath -m pip install --upgrade azure-cli --quiet 2>&1 | Out-Null
+                    
+                    $newVersion = az version --query '\"azure-cli\"' -o tsv
+                    Write-Host "Updated Azure CLI version: $newVersion"
+                  } else {
+                    Write-Host "Warning: Could not find Azure CLI Python, continuing with current version"
+                  }
+                  
+                  Write-Host ""
+                  Write-Host "##[section]Checking if resource group exists..."
+                  
+                  # Check if the hosts resource group exists, create it if not
+                  $rgExists = az group exists --name "$(hostsresourcegroup)" --output tsv
+                  
+                  if ($rgExists -eq "false") {
+                    Write-Host "Resource group '$(hostsresourcegroup)' does not exist. Creating it..."
+                    
+                    # Build tags for resource group - Azure Policy requires specific tags
+                    $rgTagsArray = @()
+                    if ($deploymentParams.tags) {
+                      Write-Host "Using tags from deployment parameters:"
+                      foreach ($key in $deploymentParams.tags.Keys) {
+                        $value = $deploymentParams.tags[$key]
+                        # Escape any special characters in tag values
+                        $escapedValue = $value -replace '"', '\"'
+                        $rgTagsArray += "`"$key=$escapedValue`""
+                        Write-Host "  $key = $value"
+                      }
+                    }
+                    
+                    Write-Host ""
+                    Write-Host "Creating resource group in location: $(vmLocation)"
+                    
+                    if ($rgTagsArray.Count -gt 0) {
+                      $tagsString = $rgTagsArray -join " "
+                      $createCmd = "az group create --name `"$(hostsresourcegroup)`" --location `"$(vmLocation)`" --tags $tagsString --output none"
+                      Write-Host "Command: $createCmd"
+                      Invoke-Expression $createCmd
+                    } else {
+                      Write-Host "##[warning]No tags found - resource group creation may fail due to Azure Policy"
+                      az group create --name "$(hostsresourcegroup)" --location "$(vmLocation)" --output none
+                    }
+                    
+                    if ($LASTEXITCODE -eq 0) {
+                      Write-Host "Resource group '$(hostsresourcegroup)' created successfully"
+                    } else {
+                      Write-Host "##[error]Failed to create resource group '$(hostsresourcegroup)'"
+                      Write-Host "##[error]Azure Policy requires these tags: businessdomain, team, product, owner, environment, applicationowner, app"
+                      Write-Host "##[error]Please ensure these tags are defined in the deployment parameters or create the resource group manually."
+                      exit 1
+                    }
+                  } else {
+                    Write-Host "Resource group '$(hostsresourcegroup)' already exists"
+                  }
+                  
+                  # ---------------------------------------------------------------
+                  # Availability Zone iteration (Approach A)
+                  # Try deploying ALL VMs in zone 1. If a zone capacity error
+                  # occurs, clean up, then try ALL VMs in zone 2, then zone 3.
+                  # This avoids partial failures from spreading across zones.
+                  # ---------------------------------------------------------------
+                  $zonesToTry = @("1", "2", "3")
+                  $deploymentSucceeded = $false
+                  $usedZone = $null
+                  $zoneCapacityErrorCodes = @(
+                    'SkuNotAvailable',
+                    'ZonalAllocationFailed',
+                    'AllocationFailed',
+                    'OverconstrainedZonalAllocationRequest',
+                    'OverconstrainedAllocationRequest',
+                    'InvalidParameter',
+                    'InternalDiskManagementError'
+                  )
+                  
+                  for ($zoneIdx = 0; $zoneIdx -lt $zonesToTry.Count; $zoneIdx++) {
+                    $currentZone = $zonesToTry[$zoneIdx]
+                    $attempt = $zoneIdx + 1
+                    $deploymentName = "Deploy-$operationType-Hosts-$(hostpoolname)-${{ parameters.DeploymentActivation }}-$(Build.BuildId)-z$currentZone"
+                    
+                    # Set the single-zone array so all VMs land in the same zone
+                    $deploymentParams["availabilityZones"] = @($currentZone)
+                    
+                    Write-Host ""
+                    Write-Host "##[section]Attempt $attempt/$($zonesToTry.Count) - Deploying all VMs in Availability Zone $currentZone"
+                    Write-Host "Deployment name: $deploymentName"
+                    
+                    # Write temp parameter file with current zone configuration
+                    $paramFileContent = @{
+                      "`$schema" = "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#"
+                      "contentVersion" = "1.0.0.0"
+                      "parameters" = @{}
+                    }
+                    
+                    foreach ($key in $deploymentParams.Keys) {
+                      $paramFileContent.parameters[$key] = @{ "value" = $deploymentParams[$key] }
+                    }
+                    
+                    $paramFileContent | ConvertTo-Json -Depth 10 | Out-File -FilePath $tempParamFile -Encoding UTF8
+                    
+                    Write-Host ""
+                    Write-Host "##[section]Running deployment to resource group: $(hostsresourcegroup)..."
+                    
+                    # Attempt the deployment
+                    $deploymentResult = $null
+                    $deploymentExitCode = 0
+                    
+                    try {
+                      $ErrorActionPreference = "Continue"
+                      $deploymentResult = az deployment group create `
+                        --resource-group "$(hostsresourcegroup)" `
+                        --name $deploymentName `
+                        --template-file "$templatefile" `
+                        --parameters "$tempParamFile" `
+                        --mode Incremental `
+                        --no-prompt true 2>&1
+                      $deploymentExitCode = $LASTEXITCODE
+                    } catch {
+                      Write-Host "##[warning]Caught exception during deployment: $_"
+                      $deploymentExitCode = 1
+                    }
+                    
+                    if ($deploymentExitCode -eq 0) {
+                      $deploymentSucceeded = $true
+                      $usedZone = $currentZone
+                      Write-Host ""
+                      Write-Host "##[section]Deployment succeeded in Availability Zone $currentZone!"
+                      break
+                    }
+                    
+                    # Deployment failed - check if it's a zone capacity error
+                    Write-Host "##[warning]Deployment failed in zone $currentZone (exit code: $deploymentExitCode)"
+                    Write-Host ""
+                    
+                    # Collect all error codes from the deployment and nested deployments
+                    $isZoneCapacityError = $false
+                    
+                    Write-Host "##[section]Analyzing deployment errors..."
+                    $errors = az deployment operation group list `
+                      --resource-group "$(hostsresourcegroup)" `
+                      --name $deploymentName `
+                      --query "[?properties.provisioningState=='Failed'].properties.statusMessage.error" `
+                      --output json 2>$null | ConvertFrom-Json
+                    
+                    $allOps = az deployment operation group list `
+                      --resource-group "$(hostsresourcegroup)" `
+                      --name $deploymentName `
+                      --output json 2>$null | ConvertFrom-Json
+                    
+                    $allErrors = @()
+                    if ($errors) { $allErrors += $errors }
+                    
+                    if ($allOps) {
+                      $nestedDeployments = $allOps | Where-Object { 
+                        $_.properties.targetResource.resourceType -eq "Microsoft.Resources/deployments" -and 
+                        $_.properties.provisioningState -eq "Failed" 
+                      }
+                      foreach ($nested in $nestedDeployments) {
+                        $nestedName = $nested.properties.targetResource.resourceName
+                        $nestedErrors = az deployment operation group list `
+                          --resource-group "$(hostsresourcegroup)" `
+                          --name $nestedName `
+                          --query "[?properties.provisioningState=='Failed'].properties.statusMessage.error" `
+                          --output json 2>$null | ConvertFrom-Json
+                        if ($nestedErrors) { $allErrors += $nestedErrors }
+                      }
+                    }
+                    
+                    # Walk the error tree looking for zone capacity codes
+                    function Test-ZoneCapacityError($errorObj) {
+                      if ($zoneCapacityErrorCodes -contains $errorObj.code) { return $true }
+                      if ($errorObj.details) {
+                        foreach ($d in $errorObj.details) {
+                          if (Test-ZoneCapacityError $d) { return $true }
+                        }
+                      }
+                      return $false
+                    }
+                    
+                    foreach ($err in $allErrors) {
+                      Write-Host "  Error: $($err.code) - $($err.message)"
+                      if (Test-ZoneCapacityError $err) { $isZoneCapacityError = $true }
+                    }
+                    
+                    if (-not $isZoneCapacityError) {
+                      # Not a zone capacity error - show full error details and exit
+                      Write-Host ""
+                      Write-Host "##[error]Deployment failed with a non-zone-capacity error. No zone retry possible."
+                      Write-Host "##[error]Deployment output:"
+                      Write-Host $deploymentResult
+                      
+                      Write-Host ""
+                      Write-Host "##[section]Deployment Operations with Errors:"
+                      az deployment operation group list `
+                        --resource-group "$(hostsresourcegroup)" `
+                        --name $deploymentName `
+                        --query "[?properties.provisioningState=='Failed'].{Resource:properties.targetResource.resourceName, ResourceType:properties.targetResource.resourceType, Status:properties.provisioningState}" `
+                        --output table
+                      
+                      Write-Host "##vso[task.logissue type=error]Failed to deploy $operationType session hosts"
+                      exit 1
+                    }
+                    
+                    # Zone capacity error - clean up and try next zone
+                    Write-Host ""
+                    Write-Host "##[warning]Zone $currentZone has insufficient capacity for VM size '$(vmSize)'. Cleaning up and trying next zone..."
+                    
+                    for ($i = 0; $i -lt $hostCount; $i++) {
+                      $vmNumber = $startingNumber + $i
+                      $vmName = "${vmNamePrefixWithActivation}$('{0:d2}' -f $vmNumber)"
+                      $nicName = "${vmName}-nic"
+                      $osDiskName = "${vmName}-osdisk"
+                      
+                      $vmExists = az vm show --resource-group "$(hostsresourcegroup)" --name $vmName --query "name" -o tsv 2>$null
+                      if ($vmExists) {
+                        Write-Host "  Deleting VM $vmName..."
+                        az vm delete --resource-group "$(hostsresourcegroup)" --name $vmName --yes --force-deletion true --no-wait false 2>$null
+                      }
+                      
+                      $diskExists = az disk show --resource-group "$(hostsresourcegroup)" --name $osDiskName --query "name" -o tsv 2>$null
+                      if ($diskExists) {
+                        Write-Host "  Deleting disk $osDiskName..."
+                        az disk delete --resource-group "$(hostsresourcegroup)" --name $osDiskName --yes --no-wait false 2>$null
+                      }
+                      
+                      $nicExists = az network nic show --resource-group "$(hostsresourcegroup)" --name $nicName --query "name" -o tsv 2>$null
+                      if ($nicExists) {
+                        Write-Host "  Deleting NIC $nicName..."
+                        az network nic delete --resource-group "$(hostsresourcegroup)" --name $nicName 2>$null
+                      }
+                    }
+                    
+                    Write-Host "Cleanup complete."
+                  }
+                  
+                  if (-not $deploymentSucceeded) {
+                    Write-Host "##[error]All availability zones exhausted (tried: $($zonesToTry -join ', ')). No zone has capacity for VM size '$(vmSize)' in location '$(vmLocation)'."
+                    Write-Host "##vso[task.logissue type=error]Failed to deploy $operationType session hosts - no zone capacity available"
+                    exit 1
+                  }
+                  
+                  Write-Host ""
+                  Write-Host "##[section]Successfully deployed $hostCount $operationType session hosts!"
+                  Write-Host "Security Type: $(if ($isConfidentialCompute) { 'ConfidentialVM' } else { 'TrustedLaunch' })"
+                  Write-Host "Availability Zone: $usedZone"
+                  Write-Host ""
+                  Write-Host "Deployed VMs:"
+                  for ($i = 0; $i -lt $hostCount; $i++) {
+                    $vmNumber = $startingNumber + $i
+                    Write-Host "  - ${vmNamePrefixWithActivation}-$('{0:d2}' -f $vmNumber) (zone $usedZone)"
+                  }
+                  
+                } finally {
+                  # Clean up temp file
+                  if (Test-Path $tempParamFile) {
+                    Remove-Item $tempParamFile -Force
+                  }
+                }
+
+  # Schedule cleanup for replace operations
+  - stage: ScheduleCleanup_${{ parameters.deploymentIdentifier }}
+    displayName: "Schedule Old Host Cleanup"
+    condition: and(succeeded(), eq(variables.isReplaceOperation, true))
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - ShutdownAndDeallocateHosts_${{ parameters.deploymentIdentifier }}
+      - DeployNewSessionHosts_${{ parameters.deploymentIdentifier }}
+    variables:
+      subscriptionname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionname'] ]
+      hostpoolname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolname'] ]
+      hostpoolresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostpoolresourcegroup'] ]
+      hostsresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostsresourcegroup'] ]
+      automationaccountname: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.automationaccountname'] ]
+      automationresourcegroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.automationresourcegroup'] ]
+      cleanupDelayDays: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.cleanupDelayDays'] ]
+      vmNames: $[ stageDependencies.ShutdownAndDeallocateHosts_${{ parameters.deploymentIdentifier }}.ShutdownHosts.outputs['shutdownHosts.vmNames'] ]
+    jobs:
+      - job: ScheduleCleanup
+        displayName: 'Schedule Deletion'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Re-apply Drain Mode on Old Hosts"
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                az account set --subscription $(subscriptionname)
+                
+                Write-Host "##[section]Re-applying drain mode on old hosts"
+                Write-Host "Drain mode may have been reset during deallocation or deployment."
+                Write-Host ""
+                
+                $vmNamesJson = '$(vmNames)'
+                
+                if ([string]::IsNullOrEmpty($vmNamesJson) -or $vmNamesJson -eq '[]') {
+                  Write-Host "No VMs to process"
+                  exit 0
+                }
+                
+                $vmNames = $vmNamesJson | ConvertFrom-Json
+                
+                if ($vmNames.Count -eq 0) {
+                  Write-Host "No VMs to process"
+                  exit 0
+                }
+                
+                $subscriptionId = az account show --query "id" -o tsv 2>$null
+                $apiVersion = "2023-09-05"
+                $body = '{"properties":{"allowNewSession":false}}'
+                
+                $successCount = 0
+                $failCount = 0
+                
+                foreach ($vmName in $vmNames) {
+                  # Session host name in the host pool is vmName.domainSuffix
+                  # Query the host pool to find the matching session host
+                  $hostPoolUri = "https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/$(hostpoolresourcegroup)/providers/Microsoft.DesktopVirtualization/hostPools/$(hostpoolname)/sessionHosts?api-version=${apiVersion}"
+                  
+                  $allHosts = az rest --method GET --uri "$hostPoolUri" -o json 2>$null | ConvertFrom-Json
+                  
+                  # Find the session host matching this VM name
+                  $matchingHost = $allHosts.value | Where-Object {
+                    $shName = $_.name -split "/" | Select-Object -Last 1
+                    $shVmName = ($shName -split "\.")[0]
+                    $shVmName -eq $vmName
+                  }
+                  
+                  if ($matchingHost) {
+                    $sessionHostName = $matchingHost.name -split "/" | Select-Object -Last 1
+                    Write-Host "Processing: $vmName (session host: $sessionHostName)"
+                    
+                    $shUri = "$($matchingHost.id)?api-version=${apiVersion}"
+                    
+                    $tempBodyFile = [System.IO.Path]::GetTempFileName()
+                    [System.IO.File]::WriteAllText($tempBodyFile, $body)
+                    
+                    $null = az rest --method PATCH --uri "$shUri" --body "@$tempBodyFile" 2>&1
+                    
+                    if ($LASTEXITCODE -eq 0) {
+                      # Verify
+                      $verifyResult = az rest --method GET --uri "$shUri" -o json 2>$null
+                      $verifyData = $verifyResult | ConvertFrom-Json
+                      if ($verifyData.properties.allowNewSession -eq $false) {
+                        Write-Host "  [OK] Drain mode enabled (verified)"
+                        $successCount++
+                      } else {
+                        Write-Host "  [WARN] PATCH succeeded but allowNewSession is still True, retrying inline..."
+                        $null = az rest --method PATCH --uri "$shUri" --body "$body" 2>&1
+                        if ($LASTEXITCODE -eq 0) {
+                          Write-Host "  [OK] Retry succeeded"
+                          $successCount++
+                        } else {
+                          Write-Host "  [FAIL] Retry also failed"
+                          $failCount++
+                        }
+                      }
+                    } else {
+                      Write-Host "  [FAIL] Could not set drain mode"
+                      $failCount++
+                    }
+                    
+                    Remove-Item $tempBodyFile -Force -ErrorAction SilentlyContinue
+                  } else {
+                    Write-Host "Processing: $vmName - session host not found in host pool (may already be removed)"
+                  }
+                }
+                
+                Write-Host ""
+                Write-Host "##[section]Drain Mode Summary"
+                Write-Host "Successfully set: $successCount hosts"
+                if ($failCount -gt 0) {
+                  Write-Host "Failed: $failCount hosts"
+                }
+                
+                # Don't fail the pipeline if drain mode can't be re-applied
+                exit 0
+
+          - task: AzureCLI@2
+            displayName: "Schedule Old Host Deletion"
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnection }}'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                az account set --subscription $(subscriptionname)
+                
+                # Ensure we have the cleanup delay as an integer
+                $cleanupDays = [int]$(cleanupDelayDays)
+                
+                Write-Host "##[section]Scheduling cleanup of old hosts in $cleanupDays days"
+                
+                $vmNamesJson = '$(vmNames)'
+                
+                # Handle case where there are no VMs to clean up
+                if ([string]::IsNullOrEmpty($vmNamesJson) -or $vmNamesJson -eq '[]') {
+                  Write-Host "No VMs to schedule for cleanup"
+                  exit 0
+                }
+                
+                $vmNames = $vmNamesJson | ConvertFrom-Json
+                
+                if ($vmNames.Count -eq 0) {
+                  Write-Host "No VMs to schedule for cleanup"
+                  exit 0
+                }
+                
+                Write-Host "VMs scheduled for cleanup:"
+                foreach ($vmName in $vmNames) {
+                  Write-Host "  - $vmName"
+                }
+                
+                # Calculate cleanup date properly
+                $currentDate = Get-Date
+                $cleanupDate = $currentDate.AddDays($cleanupDays)
+                $cleanupDateISO = $cleanupDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                
+                Write-Host ""
+                Write-Host "Current date: $($currentDate.ToString('yyyy-MM-dd HH:mm:ss'))"
+                Write-Host "Cleanup will occur on: $($cleanupDate.ToString('yyyy-MM-dd HH:mm:ss'))"
+                Write-Host "ISO format: $cleanupDateISO"
+                
+                # Create or update tags on VMs to track cleanup schedule
+                $taggedCount = 0
+                $failedCount = 0
+                
+                foreach ($vmName in $vmNames) {
+                  Write-Host "Tagging VM $vmName for scheduled cleanup..."
+                  
+                  # Check if VM still exists before trying to tag it
+                  $vmExists = az vm show --resource-group "$(hostsresourcegroup)" --name $vmName --query "name" -o tsv 2>$null
+                  
+                  if ($vmExists) {
+                    # Apply all tags in a single update
+                    $taggedOn = $currentDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    $output = az vm update --resource-group "$(hostsresourcegroup)" --name $vmName --set tags.ScheduledForDeletion="$cleanupDateISO" tags.ReplacementDeploymentId="$(Build.BuildId)" tags.ReplacementStatus="Replaced" tags.CleanupDelayDays="$cleanupDays" tags.TaggedOn="$taggedOn" 2>&1
+                    
+                    if ($LASTEXITCODE -eq 0) {
+                      Write-Host "  [OK] Successfully tagged for deletion on $($cleanupDate.ToString('yyyy-MM-dd'))"
+                      $taggedCount++
+                    } else {
+                      $errorMsg = ($output | Out-String).Trim()
+                      Write-Host "  [FAIL] Failed to tag VM"
+                      Write-Host "  Error: $errorMsg"
+                      $failedCount++
+                    }
+                  } else {
+                    Write-Host "  [SKIP] VM no longer exists (already deleted)"
+                  }
+                }
+                
+                Write-Host ""
+                Write-Host "##[section]============================================"
+                Write-Host "CLEANUP SCHEDULING COMPLETE"
+                Write-Host "============================================"
+                Write-Host "Tagged $taggedCount of $($vmNames.Count) VMs for deletion"
+                if ($failedCount -gt 0) {
+                  Write-Host "Failed to tag: $failedCount VMs"
+                }
+                Write-Host "Deletion date: $($cleanupDate.ToString('yyyy-MM-dd HH:mm:ss'))"
+                Write-Host ""
+                Write-Host "Next Steps:"
+                Write-Host "1. Create an Azure Automation runbook that:"
+                Write-Host "   - Runs daily to check for VMs with ScheduledForDeletion tags"
+                Write-Host "   - Deletes VMs and associated resources when the date is reached"
+                Write-Host "2. Or manually delete the VMs on $($cleanupDate.ToString('yyyy-MM-dd'))"
+                Write-Host ""
+                Write-Host "Tagged VMs:"
+                foreach ($vmName in $vmNames) {
+                  Write-Host "  - $vmName"
+                }
+                Write-Host ""
+                Write-Host "To manually delete these VMs later, run:"
+                Write-Host "az vm delete --resource-group $(hostsresourcegroup) --name <vmname> --yes"
+                Write-Host "============================================"
+                
+                # Always exit success - tagging failures should not block the pipeline
+                exit 0

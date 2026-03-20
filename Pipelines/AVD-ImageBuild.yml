@@ -1,0 +1,1540 @@
+# ============================================================
+# AVD Image Build Pipeline
+# ============================================================
+# This pipeline automates the end-to-end AVD image lifecycle:
+#   1. Deploy / update the Image Definition in the Azure Compute Gallery
+#   2. Deploy the Azure Image Builder (AIB) template
+#   3. Run the AIB build to produce a new image version
+#   4. (Optional) Capture an existing VM as a gallery image version
+#
+# Prerequisites:
+#   - Azure Compute Gallery must already exist
+#   - User-assigned managed identity with Contributor on the
+#     image resource group and the gallery
+#   - Service connection with permissions on the images subscription
+# ============================================================
+
+trigger:
+- none
+
+pool:
+  name: ${{ parameters.agentPool }}
+
+# ── Parameters ─────────────────────────────────────────────────
+
+parameters:
+  - name: agentPool
+    type: string
+    default: '<AGENT_POOL_NAME>'
+    displayName: "Agent pool name"
+
+  - name: serviceConnectionPrd
+    type: string
+    default: '<SERVICE_CONNECTION_PRD>'
+    displayName: "Azure DevOps service connection (production)"
+
+  - name: serviceConnectionDev
+    type: string
+    default: '<SERVICE_CONNECTION_DEV>'
+    displayName: "Azure DevOps service connection (development)"
+
+  - name: approvalEnvironmentPrd
+    type: string
+    default: '<APPROVAL_ENVIRONMENT_PRD>'
+    displayName: "Azure DevOps approval environment (production)"
+
+  - name: approvalEnvironmentDev
+    type: string
+    default: '<APPROVAL_ENVIRONMENT_DEV>'
+    displayName: "Azure DevOps approval environment (development)"
+
+  - name: environment
+    type: string
+    default: 'prd'
+    displayName: "Target environment"
+    values:
+      - dev
+      - prd
+
+  - name: imageType
+    type: string
+    default: 'standard'
+    displayName: "Image type to build"
+    values:
+      - standard
+      - cvm
+
+  - name: imageProfile
+    type: string
+    default: 'intcoreapps'
+    displayName: "Image template profile"
+    values:
+      - intcoreapps
+      - cc
+      - paw
+      - rpa
+
+  - name: buildAction
+    type: string
+    default: 'imageBuilder'
+    displayName: "Build method"
+    values:
+      - imageBuilder
+      - captureVM
+
+  # ── Common parameters ──────────────────────────────────────
+  - name: galleryName
+    type: string
+    default: 'galavdimagesprdweu001'
+    displayName: "Azure Compute Gallery name"
+
+  - name: galleryResourceGroup
+    type: string
+    default: 'rg-avd-images-prd-image-weu-001'
+    displayName: "Gallery resource group"
+
+  - name: imageDefinitionName
+    type: string
+    default: 'imgd-avd-images-prd-win11-25h2-001'
+    displayName: "Image definition name"
+    values:
+      - imgd-avd-images-prd-win11-25h2-001
+      - imgd-avd-images-prd-cc-win11-25h2-001
+      - imgd-avd-images-prd-paw-win11-25h2
+      - imgd-avd-images-prd-rpa-win11-25h2
+
+  - name: imageVersionName
+    type: string
+    default: ''
+    displayName: "Image version (leave empty to auto-increment)"
+
+  - name: replicationRegions
+    type: string
+    default: 'westeurope,northeurope,belgiumcentral'
+    displayName: "Comma-separated replication regions"
+
+  # ── Image Builder parameters (ignored in captureVM mode) ──
+  - name: sourcePublisher
+    type: string
+    default: 'microsoftwindowsdesktop'
+    displayName: "(AIB) Source image publisher"
+
+  - name: sourceOffer
+    type: string
+    default: 'office-365'
+    displayName: "(AIB) Source image offer"
+
+  - name: sourceSku
+    type: string
+    default: 'win11-25h2-avd-m365'
+    displayName: "(AIB) Source image SKU"
+
+  - name: sourceVersion
+    type: string
+    default: 'latest'
+    displayName: "(AIB) Source image version"
+
+  - name: vmSize
+    type: string
+    default: 'Standard_D16as_v5'
+    displayName: "(AIB) Build VM size (use Standard_DC8as_v6 for CVM)"
+
+  - name: imageTemplateBicepParam
+    type: string
+    default: 'auto'
+    displayName: "(AIB) Path to .bicepparam file for AIB template ('auto' = detect from image profile)"
+
+  # ── Capture VM parameters (ignored in imageBuilder mode) ──
+  - name: captureVMName
+    type: string
+    default: 'none'
+    displayName: "(Capture) VM name to capture (only for captureVM mode)"
+
+  - name: captureVMResourceGroup
+    type: string
+    default: 'none'
+    displayName: "(Capture) VM resource group (only for captureVM mode)"
+
+  - name: deleteSourceVMAfterCapture
+    type: boolean
+    default: false
+    displayName: "(Capture) Delete source VM after capture"
+
+  # ── Other ─────────────────────────────────────────────────
+  - name: deploymentIdentifier
+    type: string
+    default: 'imagebuild'
+    displayName: "Unique deployment identifier"
+
+# ── Variables ──────────────────────────────────────────────────
+
+variables:
+  - name: subscriptionName
+    ${{ if eq(parameters.environment, 'prd') }}:
+      value: 'sub-avd-images-prd'
+    ${{ else }}:
+      value: 'sub-avd-images-dev'
+  - name: serviceConnection
+    ${{ if eq(parameters.environment, 'prd') }}:
+      value: ${{ parameters.serviceConnectionPrd }}
+    ${{ else }}:
+      value: ${{ parameters.serviceConnectionDev }}
+  - name: approvalEnvironment
+    ${{ if eq(parameters.environment, 'prd') }}:
+      value: ${{ parameters.approvalEnvironmentPrd }}
+    ${{ else }}:
+      value: ${{ parameters.approvalEnvironmentDev }}
+  - name: location
+    value: 'westeurope'
+
+# ── Stages ─────────────────────────────────────────────────────
+
+stages:
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 1 – Approval Gate                                 │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: ApprovalGate_${{ parameters.deploymentIdentifier }}
+    displayName: 'Approval Gate'
+    jobs:
+      - deployment: imageBuildApproval
+        displayName: "Approval Gate for Image Build"
+        environment: $(approvalEnvironment)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 2 – Validate & Prepare                            │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: Validate_${{ parameters.deploymentIdentifier }}
+    displayName: 'Validate & Prepare'
+    dependsOn: ApprovalGate_${{ parameters.deploymentIdentifier }}
+    condition: succeeded('ApprovalGate_${{ parameters.deploymentIdentifier }}')
+    jobs:
+      - job: ValidateInputs
+        displayName: 'Validate Inputs & Gallery'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Validate Azure Compute Gallery"
+            name: validation
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                Write-Host "##[section]Validating Azure Compute Gallery"
+                Write-Host "##[section]Pipeline Parameters:"
+                Write-Host "  Environment      : ${{ parameters.environment }}"
+                Write-Host "  Image Profile    : ${{ parameters.imageProfile }}"
+                Write-Host "  Image Definition : ${{ parameters.imageDefinitionName }}"
+                Write-Host "  Image Version    : ${{ coalesce(parameters.imageVersionName, '(auto-increment)') }}"
+                Write-Host "  Gallery          : ${{ parameters.galleryName }}"
+                Write-Host "  Resource Group   : ${{ parameters.galleryResourceGroup }}"
+                Write-Host "  Build Action     : ${{ parameters.buildAction }}"
+                Write-Host "  Image Type       : ${{ parameters.imageType }}"
+                Write-Host "  VM Size          : ${{ parameters.vmSize }}"
+                Write-Host "  Replication      : ${{ parameters.replicationRegions }}"
+                Write-Host "  Bicepparam       : ${{ parameters.imageTemplateBicepParam }}"
+
+                # Validate mode-specific parameters
+                $buildAction = "${{ parameters.buildAction }}"
+                if ($buildAction -eq "captureVM") {
+                  $captureVM = "${{ parameters.captureVMName }}"
+                  $captureRG = "${{ parameters.captureVMResourceGroup }}"
+                  if ($captureVM -eq 'none' -or [string]::IsNullOrEmpty($captureVM) -or $captureRG -eq 'none' -or [string]::IsNullOrEmpty($captureRG)) {
+                    Write-Host "##vso[task.logissue type=error]Build action is 'captureVM' but required parameters are missing:"
+                    if ($captureVM -eq 'none' -or [string]::IsNullOrEmpty($captureVM)) { Write-Host "  - captureVMName is not set" }
+                    if ($captureRG -eq 'none' -or [string]::IsNullOrEmpty($captureRG)) { Write-Host "  - captureVMResourceGroup is not set" }
+                    exit 1
+                  }
+                  Write-Host "[OK] Capture mode parameters validated (VM: $captureVM, RG: $captureRG)"
+                } else {
+                  Write-Host "[OK] Image Builder mode - capture parameters not required"
+                }
+
+                # Validate gallery exists
+                $galleryJson = az sig show `
+                  --gallery-name "${{ parameters.galleryName }}" `
+                  --resource-group "${{ parameters.galleryResourceGroup }}" `
+                  --query "id" -o tsv 2>$null
+
+                if (-not $galleryJson) {
+                  Write-Host "##vso[task.logissue type=error]Gallery '${{ parameters.galleryName }}' not found in resource group '${{ parameters.galleryResourceGroup }}'."
+                  exit 1
+                }
+                Write-Host "[OK] Gallery found: $galleryJson"
+                Write-Host "##vso[task.setvariable variable=galleryId;isOutput=true]$galleryJson"
+
+                # Determine next image version if not specified
+                $imageVersion = "${{ parameters.imageVersionName }}"
+                if ([string]::IsNullOrEmpty($imageVersion)) {
+                  Write-Host "##[section]Auto-detecting next image version..."
+
+                  $versions = az sig image-version list `
+                    --gallery-name "${{ parameters.galleryName }}" `
+                    --gallery-image-definition "${{ parameters.imageDefinitionName }}" `
+                    --resource-group "${{ parameters.galleryResourceGroup }}" `
+                    --query "[].name" -o tsv 2>$null
+
+                  if ($versions) {
+                    $latestVersion = $versions | Sort-Object { [version]$_ } | Select-Object -Last 1
+                    Write-Host "Latest existing version: $latestVersion"
+                    $versionParts = $latestVersion.Split('.')
+                    $versionParts[2] = [int]$versionParts[2] + 1
+                    $imageVersion = $versionParts -join '.'
+                  } else {
+                    $imageVersion = "1.0.0"
+                    Write-Host "No existing versions found. Starting at 1.0.0"
+                  }
+                } else {
+                  # Manual version specified - check it doesn't already exist
+                  Write-Host "Manual image version specified: $imageVersion"
+                  $existingVersion = az sig image-version show `
+                    --gallery-name "${{ parameters.galleryName }}" `
+                    --gallery-image-definition "${{ parameters.imageDefinitionName }}" `
+                    --gallery-image-version "$imageVersion" `
+                    --resource-group "${{ parameters.galleryResourceGroup }}" `
+                    --query "name" -o tsv 2>$null
+                  if (-not [string]::IsNullOrWhiteSpace($existingVersion)) {
+                    Write-Host "##vso[task.logissue type=error]Image version '$imageVersion' already exists in definition '${{ parameters.imageDefinitionName }}'. Choose a different version or leave empty for auto-increment."
+                    exit 1
+                  }
+                }
+
+                Write-Host "[OK] Image version to create: $imageVersion"
+                Write-Host "##vso[task.setvariable variable=imageVersion;isOutput=true]$imageVersion"
+
+                # Detect managed identity for AIB
+                # Identity names may use 'uami-' or 'umi-' prefix depending on the resource type
+                $managedIdentitiesJson = az identity list `
+                  --resource-group "${{ parameters.galleryResourceGroup }}" `
+                  --query "[?contains(name, ``uami-``) || contains(name, ``umi-``)]" 2>&1
+
+                $managedIdentitiesJson = $managedIdentitiesJson | Where-Object { $_ -notmatch "WARNING:" } | Out-String
+
+                if (-not [string]::IsNullOrWhiteSpace($managedIdentitiesJson)) {
+                  $managedIdentities = $managedIdentitiesJson | ConvertFrom-Json
+                  if ($managedIdentities -and $managedIdentities.Count -gt 0) {
+                    $uamiId = $managedIdentities[0].id
+                    Write-Host "[OK] User-Assigned Managed Identity: $uamiId"
+                    Write-Host "##vso[task.setvariable variable=userAssignedIdentityId;isOutput=true]$uamiId"
+                  } else {
+                    Write-Host "##vso[task.logissue type=warning]No managed identity found. AIB template deployment may fail."
+                    Write-Host "##vso[task.setvariable variable=userAssignedIdentityId;isOutput=true]"
+                  }
+                } else {
+                  Write-Host "##vso[task.logissue type=warning]No managed identity found."
+                  Write-Host "##vso[task.setvariable variable=userAssignedIdentityId;isOutput=true]"
+                }
+
+                Write-Host "##[section]Validation completed successfully"
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 3 – Deploy Image Definition                       │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: DeployImageDefinition_${{ parameters.deploymentIdentifier }}
+    displayName: 'Deploy Image Definition'
+    dependsOn:
+      - Validate_${{ parameters.deploymentIdentifier }}
+    variables:
+      galleryId: $[ stageDependencies.Validate_${{ parameters.deploymentIdentifier }}.ValidateInputs.outputs['validation.galleryId'] ]
+    jobs:
+      - job: DeployDefinition
+        displayName: 'Deploy Image Definition to Gallery'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Deploy Image Definition (Bicep)"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                $imageType = "${{ parameters.imageType }}"
+
+                Write-Host "##[section]Deploying Image Definition"
+                Write-Host "Image Type: $imageType"
+
+                # Both standard and CVM use the same generic Image module
+                $templateFile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/AzureVirtualDesktop/AzureComputeGallery/Image/main.bicep"
+
+                if (-not (Test-Path $templateFile)) {
+                  Write-Host "##vso[task.logissue type=error]Image definition template not found: $templateFile"
+                  exit 1
+                }
+
+                # Check for a matching .bicepparam file in the environments folder
+                $paramDir = "$(System.DefaultWorkingDirectory)/Environments/sub-avd-images-${{ parameters.environment }}/images/AzureComputeGallery/ImageDefinitions"
+                $paramFile = "$paramDir/${{ parameters.imageDefinitionName }}.bicepparam"
+
+                if (Test-Path $paramFile) {
+                  Write-Host "Using .bicepparam file: $paramFile"
+
+                  az deployment group create `
+                    --resource-group "${{ parameters.galleryResourceGroup }}" `
+                    --name "Deploy-ImageDef-$(Build.BuildId)" `
+                    --parameters "$paramFile" `
+                    --mode Incremental
+                } else {
+                  Write-Host "No .bicepparam file found, deploying with inline parameters"
+
+                  $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+                  # Set CVM-specific parameters
+                  if ($imageType -eq 'cvm') {
+                    $offer = "Windows11-25H2"
+                    $sku = "CCMultiSession"
+                    $features = '[{\"name\":\"SecurityType\",\"value\":\"TrustedLaunchAndConfidentialVmSupported\"}]'
+                  } else {
+                    $offer = "AVD"
+                    $sku = "${{ parameters.sourceSku }}"
+                    $features = '[{\"name\":\"SecurityType\",\"value\":\"TrustedLaunch\"}]'
+                  }
+
+                  az deployment group create `
+                    --resource-group "${{ parameters.galleryResourceGroup }}" `
+                    --name "Deploy-ImageDef-$(Build.BuildId)" `
+                    --template-file "$templateFile" `
+                    --parameters galleryName="${{ parameters.galleryName }}" `
+                               imageName="${{ parameters.imageDefinitionName }}" `
+                               publisher="<ORGANIZATION_NAME>" `
+                               offer="$offer" `
+                               sku="$sku" `
+                               features="$features" `
+                               tags="{\"environment\":\"${{ parameters.environment }}\",\"workload\":\"avd\",\"managedBy\":\"bicep\",\"lastUpdated\":\"$timestamp\"}" `
+                    --mode Incremental
+                }
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to deploy image definition."
+                  exit 1
+                }
+
+                Write-Host "##[section]Image Definition deployed successfully"
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 3a – Prepare VNet for AIB (intcoreapps only)      │
+  # └──────────────────────────────────────────────────────────┘
+  # When the AIB build VM is deployed into an existing VNet (vnetConfig),
+  # three prerequisites must be met:
+  #   1. privateLinkServiceNetworkPolicies must be Disabled on the subnet
+  #   2. The NSG must allow AzureLoadBalancer → VirtualNetwork on 60000-60001
+  #   3. The AIB managed identity needs VNet read + subnet join permissions
+  # This stage is idempotent - safe to run multiple times.
+  # Ref: https://learn.microsoft.com/azure/virtual-machines/linux/image-builder-networking
+  - stage: PrepareVNet_${{ parameters.deploymentIdentifier }}
+    displayName: 'Prepare VNet for AIB'
+    condition: and(succeeded(), eq('${{ parameters.imageProfile }}', 'intcoreapps'), eq('${{ parameters.buildAction }}', 'imageBuilder'))
+    dependsOn:
+      - Validate_${{ parameters.deploymentIdentifier }}
+      - DeployImageDefinition_${{ parameters.deploymentIdentifier }}
+    variables:
+      userAssignedIdentityId: $[ stageDependencies.Validate_${{ parameters.deploymentIdentifier }}.ValidateInputs.outputs['validation.userAssignedIdentityId'] ]
+    jobs:
+      - job: ConfigureVNet
+        displayName: 'Configure VNet Prerequisites for AIB'
+        steps:
+          - checkout: none
+
+          - task: AzureCLI@2
+            displayName: "Ensure AIB VNet Prerequisites"
+            name: vnetPrep
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Stop'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                # Helper: check az CLI exit code and fail fast with a clear message
+                function Assert-AzSuccess {
+                  param([string]$Message)
+                  if ($LASTEXITCODE -ne 0) {
+                    Write-Host "##vso[task.logissue type=error]$Message (az exit code: $LASTEXITCODE)"
+                    exit 1
+                  }
+                }
+
+                # ── Parse the subnet ID from the .bicepparam ──
+                # The subnet must be in the SAME subscription as the AIB image template (sub-avd-images-prd).
+                # The images VNet is peered to the vWAN hub for connectivity to storage private endpoints.
+                $subnetId = '/subscriptions/<SUBSCRIPTION_ID_IMAGES_PRD>/resourceGroups/rg-avd-images-prd-network-weu-001/providers/Microsoft.Network/virtualNetworks/vnet-avd-images-prd-weu-001/subnets/snet-avd-images-prd-hosts'
+
+                # Extract components from the subnet resource ID
+                $parts       = $subnetId -split '/'
+                $vnetSubId   = $parts[2]
+                $vnetRg      = $parts[4]
+                $vnetName    = $parts[8]
+                $subnetName  = $parts[10]
+
+                Write-Host "##[section]Preparing VNet for Azure Image Builder"
+                Write-Host "  Subscription : $vnetSubId"
+                Write-Host "  Resource Group: $vnetRg"
+                Write-Host "  VNet         : $vnetName"
+                Write-Host "  Subnet       : $subnetName"
+
+                az account set --subscription $vnetSubId
+                Assert-AzSuccess "Failed to set subscription to '$vnetSubId'"
+
+                # ── Step 1: Disable Private Link Service Network Policies on subnet ──
+                # This is required for AIB to deploy its Private Link endpoint.
+                # It does NOT affect your ability to deploy normal VMs/AVD hosts.
+                Write-Host ""
+                Write-Host "##[section]Step 1: Checking privateLinkServiceNetworkPolicies on subnet"
+
+                $currentPolicy = az network vnet subnet show `
+                  --resource-group $vnetRg `
+                  --vnet-name $vnetName `
+                  --name $subnetName `
+                  --query "privateLinkServiceNetworkPolicies" -o tsv
+
+                Write-Host "  Current value: $currentPolicy"
+
+                if ($currentPolicy -ne 'Disabled') {
+                  Write-Host "  Disabling privateLinkServiceNetworkPolicies..."
+                  az network vnet subnet update `
+                    --resource-group $vnetRg `
+                    --vnet-name $vnetName `
+                    --name $subnetName `
+                    --private-link-service-network-policies Disabled `
+                    --output none
+                  Assert-AzSuccess "Failed to disable privateLinkServiceNetworkPolicies on subnet '$subnetName'"
+                  Write-Host "[OK] privateLinkServiceNetworkPolicies set to Disabled"
+                } else {
+                  Write-Host "[OK] Already disabled - no change needed"
+                }
+
+                # ── Step 2: Ensure NSG allows AzureLoadBalancer on ports 60000-60001 ──
+                # AIB uses a load balancer to communicate with the proxy VM.
+                # Port 60000 is for Windows, 60001 for Linux.
+                Write-Host ""
+                Write-Host "##[section]Step 2: Checking NSG rule for AIB load balancer"
+
+                $nsgId = az network vnet subnet show `
+                  --resource-group $vnetRg `
+                  --vnet-name $vnetName `
+                  --name $subnetName `
+                  --query "networkSecurityGroup.id" -o tsv
+
+                if ([string]::IsNullOrWhiteSpace($nsgId) -or $nsgId -eq 'null') {
+                  Write-Host "##vso[task.logissue type=warning]No NSG attached to subnet '$subnetName'. AIB should work but consider adding an NSG for security."
+                } else {
+                  $nsgName = ($nsgId -split '/')[-1]
+                  $nsgRg = ($nsgId -split '/')[4]
+                  Write-Host "  NSG: $nsgName (RG: $nsgRg)"
+
+                  # Check if the rule already exists
+                  $existingRule = az network nsg rule show `
+                    --resource-group $nsgRg `
+                    --nsg-name $nsgName `
+                    --name 'AllowAzureImageBuilderAccess' `
+                    --query "name" -o tsv 2>$null
+
+                  if ([string]::IsNullOrWhiteSpace($existingRule)) {
+                    Write-Host "  Creating NSG rule 'AllowAzureImageBuilderAccess'..."
+                    az network nsg rule create `
+                      --resource-group $nsgRg `
+                      --nsg-name $nsgName `
+                      --name 'AllowAzureImageBuilderAccess' `
+                      --priority 400 `
+                      --access Allow `
+                      --direction Inbound `
+                      --protocol Tcp `
+                      --source-address-prefixes AzureLoadBalancer `
+                      --source-port-ranges '*' `
+                      --destination-address-prefixes VirtualNetwork `
+                      --destination-port-ranges 60000-60001 `
+                      --description 'Allow AIB Private Link traffic from Azure Load Balancer to proxy VM' `
+                      --output none
+                    Assert-AzSuccess "Failed to create NSG rule 'AllowAzureImageBuilderAccess' on NSG '$nsgName'"
+                    Write-Host "[OK] NSG rule created"
+                  } else {
+                    Write-Host "[OK] NSG rule 'AllowAzureImageBuilderAccess' already exists"
+                  }
+                }
+
+                # ── Step 3: Ensure AIB managed identity has VNet permissions ──
+                # AIB needs: Microsoft.Network/virtualNetworks/read
+                #            Microsoft.Network/virtualNetworks/subnets/join/action
+                # The simplest built-in role that covers both is 'Network Contributor',
+                # but we scope it to the VNet resource group only.
+                Write-Host ""
+                Write-Host "##[section]Step 3: Checking AIB managed identity VNet permissions"
+
+                $uamiId = "$(userAssignedIdentityId)"
+                if ([string]::IsNullOrWhiteSpace($uamiId)) {
+                  # Fallback: look up the identity directly in the images subscription
+                  Write-Host "  Variable from Validate stage is empty. Looking up identity in ${{ parameters.galleryResourceGroup }}..."
+                  $imagesSub = "$(subscriptionName)"
+                  az account set --subscription $imagesSub
+                  $uamiId = az identity list `
+                    --resource-group "${{ parameters.galleryResourceGroup }}" `
+                    --query "[?contains(name, 'umi-') || contains(name, 'uami-')].id | [0]" -o tsv 2>$null
+                  az account set --subscription $vnetSubId
+                }
+
+                if ([string]::IsNullOrWhiteSpace($uamiId)) {
+                  Write-Host "##vso[task.logissue type=error]AIB managed identity not found in RG '${{ parameters.galleryResourceGroup }}'. Cannot assign VNet permissions."
+                  exit 1
+                }
+
+                # Get the principal ID of the managed identity
+                # The --ids flag includes the full resource ID (with subscription), so --subscription is not needed
+                $principalId = az identity show --ids "$uamiId" --query "principalId" -o tsv
+                
+                if ([string]::IsNullOrWhiteSpace($principalId)) {
+                  Write-Host "##vso[task.logissue type=error]Failed to retrieve principalId for identity: $uamiId"
+                  exit 1
+                }
+
+                Write-Host "  AIB Identity   : $uamiId"
+                Write-Host "  Principal ID   : $principalId"
+
+                $vnetScope = "/subscriptions/$vnetSubId/resourceGroups/$vnetRg"
+                $roleName = "Network Contributor"
+
+                # Check if role assignment already exists
+                $existingAssignment = az role assignment list `
+                  --assignee $principalId `
+                  --role "$roleName" `
+                  --scope $vnetScope `
+                  --query "[0].id" -o tsv 2>$null
+
+                if ([string]::IsNullOrWhiteSpace($existingAssignment)) {
+                  Write-Host "  Assigning '$roleName' on scope: $vnetScope"
+                  az role assignment create `
+                    --assignee-object-id $principalId `
+                    --assignee-principal-type ServicePrincipal `
+                    --role "$roleName" `
+                    --scope $vnetScope `
+                    --output none
+                  Assert-AzSuccess "Failed to assign '$roleName' to principal '$principalId' on scope '$vnetScope'. Ensure the service connection SPN has 'Microsoft.Authorization/roleAssignments/write' permission on this scope."
+                  Write-Host "[OK] Role assignment created"
+
+                  # Role assignments can take a moment to propagate
+                  Write-Host "  Waiting 30 seconds for role propagation..."
+                  Start-Sleep -Seconds 30
+                } else {
+                  Write-Host "[OK] '$roleName' already assigned to AIB identity on $vnetScope"
+                }
+
+                Write-Host ""
+                Write-Host "##[section]VNet preparation completed successfully"
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 4a – Azure Image Builder (AIB)                    │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: RunImageBuilder_${{ parameters.deploymentIdentifier }}
+    displayName: 'Build Image (Azure Image Builder)'
+    condition: |
+      and(
+        eq('${{ parameters.buildAction }}', 'imageBuilder'),
+        in(dependencies.Validate_${{ parameters.deploymentIdentifier }}.result, 'Succeeded'),
+        in(dependencies.DeployImageDefinition_${{ parameters.deploymentIdentifier }}.result, 'Succeeded'),
+        in(dependencies.PrepareVNet_${{ parameters.deploymentIdentifier }}.result, 'Succeeded', 'Skipped')
+      )
+    dependsOn:
+      - Validate_${{ parameters.deploymentIdentifier }}
+      - DeployImageDefinition_${{ parameters.deploymentIdentifier }}
+      - PrepareVNet_${{ parameters.deploymentIdentifier }}
+    variables:
+      imageVersion: $[ stageDependencies.Validate_${{ parameters.deploymentIdentifier }}.ValidateInputs.outputs['validation.imageVersion'] ]
+      userAssignedIdentityId: $[ stageDependencies.Validate_${{ parameters.deploymentIdentifier }}.ValidateInputs.outputs['validation.userAssignedIdentityId'] ]
+    jobs:
+      - job: DeployAndRunTemplate
+        displayName: 'Deploy & Run AIB Template'
+        timeoutInMinutes: 660
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Deploy Image Builder Template"
+            name: deployTemplate
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                # Generate image template name: imgtpl-<imageProfile>-v<MMyyyy> (e.g. imgtpl-intcoreapps-v032026)
+                $imageProfile = "${{ parameters.imageProfile }}"
+                $dateStamp = Get-Date -Format "MMyyyy"
+                $imageTemplateName = "imgtpl-$imageProfile-v$dateStamp"
+
+                Write-Host "##[section]Deploying AIB Template"
+                Write-Host "  Template Name    : $imageTemplateName"
+                Write-Host "  Image Version    : $(imageVersion)"
+                Write-Host "  Image Profile    : $imageProfile"
+                Write-Host "  Image Definition : ${{ parameters.imageDefinitionName }} (pipeline param)"
+
+                # Delete existing template if it exists (AIB does not support in-place updates)
+                $existing = az image builder show `
+                  --name "$imageTemplateName" `
+                  --resource-group "${{ parameters.galleryResourceGroup }}" `
+                  --query "name" -o tsv 2>$null
+                if (-not [string]::IsNullOrWhiteSpace($existing)) {
+                  Write-Host "Existing template '$imageTemplateName' found - deleting before re-deploy..."
+                  az image builder delete `
+                    --name "$imageTemplateName" `
+                    --resource-group "${{ parameters.galleryResourceGroup }}"
+                  if ($LASTEXITCODE -eq 0) {
+                    Write-Host "[OK] Deleted existing template."
+                  } else {
+                    Write-Host "##vso[task.logissue type=warning]Failed to delete existing template. Deployment may fail."
+                  }
+                }
+
+                # Resolve .bicepparam file path
+                $bicepParamFile = "${{ parameters.imageTemplateBicepParam }}"
+                if ($bicepParamFile -eq 'auto' -or [string]::IsNullOrEmpty($bicepParamFile)) {
+                  $bicepParamFile = $null
+                  # Auto-detect from image profile: look for imgt-avd-images-<env>-<profile>-win.bicepparam
+                  $paramDir = "$(System.DefaultWorkingDirectory)/Environments/sub-avd-images-${{ parameters.environment }}/images/AzureComputeGallery/ImageTemplates"
+                  $expectedName = "imgt-avd-images-${{ parameters.environment }}-$imageProfile-win.bicepparam"
+                  $exactMatch = Join-Path $paramDir $expectedName
+                  if (Test-Path $exactMatch) {
+                    $bicepParamFile = $exactMatch
+                    Write-Host "Auto-detected .bicepparam for profile '$imageProfile': $bicepParamFile"
+                  } else {
+                    # Fallback: glob match
+                    $candidates = Get-ChildItem -Path $paramDir -Filter "*-$imageProfile-*.bicepparam" -ErrorAction SilentlyContinue
+                    if ($candidates) {
+                      $bicepParamFile = $candidates[0].FullName
+                      Write-Host "Fallback .bicepparam for profile '$imageProfile': $bicepParamFile"
+                    } else {
+                      Write-Host "##vso[task.logissue type=warning]No .bicepparam found for profile '$imageProfile' in $paramDir"
+                    }
+                  }
+                }
+
+                if (-not [string]::IsNullOrEmpty($bicepParamFile) -and (Test-Path $bicepParamFile)) {
+                  Write-Host "Using .bicepparam file: $bicepParamFile"
+
+                  # Check if the .bicepparam imageDefinitionName matches the pipeline parameter
+                  $bicepDefLine = Select-String -Path $bicepParamFile -Pattern "param imageDefinitionName\s*=" -SimpleMatch:$false | Select-Object -First 1
+                  if ($bicepDefLine) {
+                    $bicepDefName = ($bicepDefLine.Line -replace ".*=\s*'([^']+)'.*", '$1').Trim()
+                    if ($bicepDefName -ne "${{ parameters.imageDefinitionName }}") {
+                      Write-Host "##[warning]Image definition MISMATCH detected!"
+                      Write-Host "  .bicepparam file has : $bicepDefName"
+                      Write-Host "  Pipeline parameter   : ${{ parameters.imageDefinitionName }}"
+                      Write-Host "  The pipeline parameter will be used (override)."
+                    }
+                  }
+
+                  Write-Host "Overriding imageTemplateName to   : $imageTemplateName"
+                  Write-Host "Overriding imageVersionNumber to   : $(imageVersion)"
+                  Write-Host "Overriding imageDefinitionName to  : ${{ parameters.imageDefinitionName }}"
+                  Write-Host "Overriding vmSize to               : ${{ parameters.vmSize }}"
+
+                  # Build the deployment command
+                  $deployArgs = @(
+                    'deployment', 'group', 'create',
+                    '--resource-group', "${{ parameters.galleryResourceGroup }}",
+                    '--name', "Deploy-AIB-Template-$(Build.BuildId)",
+                    '--parameters', "$bicepParamFile",
+                    '--parameters', "imageTemplateName=$imageTemplateName",
+                                    "imageVersionNumber=$(imageVersion)",
+                                    "imageDefinitionName=${{ parameters.imageDefinitionName }}",
+                                    "vmSize=${{ parameters.vmSize }}",
+                    '--mode', 'Incremental'
+                  )
+
+                  az @deployArgs
+                } else {
+                  Write-Host "Using inline parameters"
+
+                  # Parse replication regions
+                  $regionsParam = "${{ parameters.replicationRegions }}" -split ',' | ForEach-Object { $_.Trim() }
+                  $regionsJson = $regionsParam | ConvertTo-Json -Compress
+
+                  $templateFile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/AzureVirtualDesktop/AzureComputeGallery/Image/Template/main.bicep"
+                  $paramFile = "$(System.DefaultWorkingDirectory)/ComponentLibrary/AzureVirtualDesktop/AzureComputeGallery/Image/Template/main.parameters.json"
+
+                  if (-not (Test-Path $templateFile)) {
+                    Write-Host "##vso[task.logissue type=error]AIB template file not found: $templateFile"
+                    exit 1
+                  }
+
+                  $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+                  az deployment group create `
+                    --resource-group "${{ parameters.galleryResourceGroup }}" `
+                    --name "Deploy-AIB-Template-$(Build.BuildId)" `
+                    --template-file "$templateFile" `
+                    --parameters "$paramFile" `
+                    --parameters galleryName="${{ parameters.galleryName }}" `
+                               imageDefinitionName="${{ parameters.imageDefinitionName }}" `
+                               imageTemplateName="$imageTemplateName" `
+                               imageVersionNumber="$(imageVersion)" `
+                               userAssignedIdentityId="$(userAssignedIdentityId)" `
+                               sourcePublisher="${{ parameters.sourcePublisher }}" `
+                               sourceOffer="${{ parameters.sourceOffer }}" `
+                               sourceSku="${{ parameters.sourceSku }}" `
+                               sourceVersion="${{ parameters.sourceVersion }}" `
+                               vmSize="${{ parameters.vmSize }}" `
+                               replicationRegions="$regionsJson" `
+                               tags="{\"environment\":\"${{ parameters.environment }}\",\"workload\":\"avd\",\"managedBy\":\"bicep\",\"buildId\":\"$(Build.BuildId)\",\"createdAt\":\"$timestamp\"}" `
+                    --mode Incremental
+                }
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to deploy AIB template."
+                  exit 1
+                }
+
+                Write-Host "[OK] AIB template deployed: $imageTemplateName"
+                Write-Host "##vso[task.setvariable variable=imageTemplateName;isOutput=true]$imageTemplateName"
+
+          - task: AzureCLI@2
+            displayName: "Run Image Builder Build"
+            timeoutInMinutes: 630
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                # Verify we are on the correct subscription
+                $currentSub = az account show --query "{name:name, id:id}" -o json | ConvertFrom-Json
+                Write-Host "Active subscription: $($currentSub.name) ($($currentSub.id))"
+                if ($currentSub.name -ne "$(subscriptionName)") {
+                  Write-Host "##vso[task.logissue type=warning]Expected subscription '$(subscriptionName)' but got '$($currentSub.name)'. Retrying with subscription ID..."
+                  # Fallback: list subscriptions and find the correct one by name
+                  $targetSub = az account list --query "[?name=='$(subscriptionName)'].id" -o tsv 2>$null
+                  if (-not [string]::IsNullOrWhiteSpace($targetSub)) {
+                    az account set --subscription "$targetSub"
+                    $currentSub = az account show --query "{name:name, id:id}" -o json | ConvertFrom-Json
+                    Write-Host "Switched to subscription: $($currentSub.name) ($($currentSub.id))"
+                  } else {
+                    Write-Host "##vso[task.logissue type=error]Could not find subscription '$(subscriptionName)' in accessible subscriptions."
+                    exit 1
+                  }
+                }
+
+                $imageTemplateName = "$(deployTemplate.imageTemplateName)"
+                Write-Host "##[section]Starting AIB Build: $imageTemplateName"
+                Write-Host "This may take 2-6 hours depending on customizations..."
+
+                # Trigger the image template build
+                az image builder run `
+                  --name "$imageTemplateName" `
+                  --resource-group "${{ parameters.galleryResourceGroup }}" `
+                  --no-wait
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to start AIB build."
+                  exit 1
+                }
+
+                Write-Host "Build started. Polling for completion..."
+
+                # Poll for build completion
+                $maxWaitMinutes = 600
+                $pollIntervalSeconds = 120
+                $elapsed = 0
+
+                # ── Live log tailing state ──
+                # We'll discover the staging storage account on the first successful status check,
+                # then periodically download and tail the customization.log to show progress.
+                $stagingSa = $null
+                $stagingRg = $null
+                $stagingKey = $null
+                $logBlobName = $null
+                $lastLogLineCount = 0
+                $logCheckInterval = 5        # check log every N poll cycles (= every 10 min with 120s poll)
+                $pollCount = 0
+                $galleryRg = "${{ parameters.galleryResourceGroup }}"
+
+                function Discover-StagingStorage {
+                  # Find the AIB staging resource group (IT_<galleryRg>_<templatePrefix>_<guid>)
+                  $rgs = az group list --query "[?starts_with(name, 'IT_${galleryRg}_')].name" -o tsv 2>$null
+                  if ([string]::IsNullOrWhiteSpace($rgs)) { return $null }
+                  foreach ($rg in ($rgs -split "`n" | Where-Object { $_ })) {
+                    $sas = az storage account list --resource-group $rg --query "[].name" -o tsv 2>$null
+                    foreach ($sa in ($sas -split "`n" | Where-Object { $_ })) {
+                      $key = az storage account keys list --account-name $sa --resource-group $rg --query "[0].value" -o tsv 2>$null
+                      if ([string]::IsNullOrWhiteSpace($key)) { continue }
+                      $blob = az storage blob list --account-name $sa --container-name "packerlogs" --account-key $key `
+                        --query "[?ends_with(name, 'customization.log')].name" -o tsv 2>$null
+                      if (-not [string]::IsNullOrWhiteSpace($blob)) {
+                        return @{ ResourceGroup = $rg; AccountName = $sa; Key = $key; BlobName = ($blob -split "`n")[0].Trim() }
+                      }
+                    }
+                  }
+                  return $null
+                }
+
+                function Show-LogTail {
+                  param([hashtable]$Storage, [int]$TailLines = 20)
+                  if (-not $Storage) { return 0 }
+                  $tempFile = Join-Path $env:TEMP "customization_tail_$(Get-Random).log"
+                  try {
+                    az storage blob download --account-name $Storage.AccountName --container-name "packerlogs" `
+                      --name $Storage.BlobName --file $tempFile --account-key $Storage.Key --no-progress 2>$null | Out-Null
+                    if (Test-Path $tempFile) {
+                      $lines = Get-Content $tempFile
+                      $totalLines = $lines.Count
+                      # Show only the packer ui/provisioner lines from the tail (filter noise)
+                      $relevantLines = $lines | Where-Object {
+                        $_ -match 'ui:|packer-provisioner|PACKER ERR|==> azure-arm:' -and $_ -notmatch '\[DEBUG\]'
+                      } | Select-Object -Last $TailLines
+                      if ($relevantLines) {
+                        # Check if we're reading a stale log from a previous build
+                        $staleMarker = $relevantLines | Where-Object { $_ -match "Build 'azure-arm' finished" }
+                        if ($staleMarker) {
+                          Write-Host "    (log appears to be from a previous build - waiting for current build to start writing)"
+                        } else {
+                          Write-Host "    ┌─── customization.log tail ($totalLines lines total) ───"
+                          foreach ($line in $relevantLines) {
+                            # Extract just the message part after the timestamp/GUID prefix
+                            if ($line -match 'ui:\s*==> azure-arm:\s*(.+)$') {
+                              Write-Host "    │ $($Matches[1])"
+                            } elseif ($line -match 'ui:\s*(.+)$') {
+                              Write-Host "    │ $($Matches[1])"
+                            } elseif ($line -match 'ui error:\s*(.+)$') {
+                              Write-Host "    │ [ERROR] $($Matches[1])"
+                            } else {
+                              # Strip leading timestamp + GUID prefix if present, show remainder
+                              $cleaned = $line -replace '^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+[a-f0-9-]+:\s*', ''
+                              Write-Host "    │ $cleaned"
+                            }
+                          }
+                          Write-Host "    └───"
+                        }
+                      }
+                      return $totalLines
+                    }
+                  } catch {
+                    Write-Host "    (could not tail log: $_)"
+                  } finally {
+                    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue 2>$null
+                  }
+                  return 0
+                }
+
+                do {
+                  Start-Sleep -Seconds $pollIntervalSeconds
+                  $elapsed += $pollIntervalSeconds
+                  $pollCount++
+
+                  # Single query to get the full lastRunStatus object
+                  $statusJson = az image builder show `
+                    --name "$imageTemplateName" `
+                    --resource-group "${{ parameters.galleryResourceGroup }}" `
+                    --query "lastRunStatus" -o json 2>$null
+
+                  if ([string]::IsNullOrWhiteSpace($statusJson) -or $statusJson -eq 'null') {
+                    # lastRunStatus may not exist yet if build just started - try under properties path
+                    $statusJson = az image builder show `
+                      --name "$imageTemplateName" `
+                      --resource-group "${{ parameters.galleryResourceGroup }}" `
+                      --query "properties.lastRunStatus" -o json 2>$null
+                  }
+
+                  $elapsedMin = [math]::Round($elapsed / 60, 0)
+                  $elapsedHrs = [math]::Round($elapsed / 3600, 1)
+
+                  if ([string]::IsNullOrWhiteSpace($statusJson) -or $statusJson -eq 'null') {
+                    Write-Host "[$elapsedMin min] Build status: Running (awaiting first status update)"
+                    continue
+                  }
+
+                  $statusObj = $statusJson | ConvertFrom-Json
+                  $status = $statusObj.runState
+                  $substatus = $statusObj.runSubState
+
+                  # Build a richer progress line
+                  $progressLine = "[$elapsedMin min / ${elapsedHrs}h] Status: $status ($substatus)"
+                  if ($statusObj.startTime) {
+                    try {
+                      $buildStart = Get-Date -Date $statusObj.startTime
+                      $buildElapsed = (Get-Date).ToUniversalTime() - $buildStart.ToUniversalTime()
+                      $progressLine += " | Build time: $([math]::Round($buildElapsed.TotalMinutes, 0)) min"
+                    } catch {
+                      # Fallback: just show the raw startTime if parsing fails
+                      $progressLine += " | Started: $($statusObj.startTime)"
+                    }
+                  }
+                  Write-Host $progressLine
+
+                  # ── Discover staging storage (once) ──
+                  if (-not $stagingSa -and $status -eq 'Running' -and $elapsed -ge 300) {
+                    Write-Host "    Discovering staging storage account..."
+                    $storageInfo = Discover-StagingStorage
+                    if ($storageInfo) {
+                      $stagingSa = $storageInfo.AccountName
+                      $stagingRg = $storageInfo.ResourceGroup
+                      $stagingKey = $storageInfo.Key
+                      $logBlobName = $storageInfo.BlobName
+                      Write-Host "    [OK] Found staging SA: $stagingSa (RG: $stagingRg)"
+                      Write-Host "    [OK] Log blob: $logBlobName"
+                    } else {
+                      Write-Host "    Staging storage not found yet (will retry on next cycle)"
+                    }
+                  }
+
+                  # ── Tail the log periodically ──
+                  if ($stagingSa -and ($pollCount % $logCheckInterval -eq 0)) {
+                    $storageHash = @{ AccountName = $stagingSa; Key = $stagingKey; BlobName = $logBlobName }
+                    $currentLineCount = Show-LogTail -Storage $storageHash -TailLines 15
+                    if ($currentLineCount -gt 0 -and $currentLineCount -ne $lastLogLineCount) {
+                      $newLines = $currentLineCount - $lastLogLineCount
+                      if ($lastLogLineCount -gt 0) {
+                        Write-Host "    (+$newLines new log lines since last check)"
+                      }
+                      $lastLogLineCount = $currentLineCount
+                    }
+                  }
+
+                  if ($status -eq "Failed") {
+                    $message = $statusObj.message
+                    Write-Host "##vso[task.logissue type=error]AIB build failed: $message"
+                    exit 1
+                  }
+
+                  if ($status -eq "Canceled") {
+                    Write-Host "##vso[task.logissue type=error]AIB build was canceled."
+                    exit 1
+                  }
+
+                } while ($status -ne "Succeeded" -and $elapsed -lt ($maxWaitMinutes * 60))
+
+                if ($status -ne "Succeeded") {
+                  Write-Host "##vso[task.logissue type=error]AIB build timed out after $maxWaitMinutes minutes."
+                  exit 1
+                }
+
+                Write-Host ""
+                Write-Host "##[section]Image build completed successfully!"
+                Write-Host "Image Template: $imageTemplateName"
+                Write-Host "Total build time: $elapsedMin minutes"
+
+          - task: AzureCLI@2
+            displayName: "Retrieve Packer Build Logs (on failure)"
+            condition: failed()
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                $imageTemplateName = "$(deployTemplate.imageTemplateName)"
+                $galleryRg = "${{ parameters.galleryResourceGroup }}"
+                $logFound = $false
+
+                # Helper: retrieve a storage account key (the SPN has Contributor which
+                # grants access to listKeys, but NOT the data-plane RBAC role
+                # 'Storage Blob Data Reader' that --auth-mode login requires).
+                function Get-StorageAccountKey {
+                  param([string]$AccountName, [string]$ResourceGroup)
+                  az storage account keys list `
+                    --account-name $AccountName `
+                    --resource-group $ResourceGroup `
+                    --query "[0].value" -o tsv 2>$null
+                }
+
+                # Helper: list and download customization.log from a storage account
+                function Get-PackerLog {
+                  param([string]$StorageAccount, [string]$StorageRg)
+
+                  $key = Get-StorageAccountKey -AccountName $StorageAccount -ResourceGroup $StorageRg
+                  if ([string]::IsNullOrWhiteSpace($key)) {
+                    Write-Host "    Could not retrieve storage key for '$StorageAccount'. Trying --auth-mode login as fallback..."
+                    $authArgs = @('--auth-mode', 'login')
+                  } else {
+                    $authArgs = @('--account-key', $key)
+                  }
+
+                  $blobs = az storage blob list `
+                    --account-name $StorageAccount `
+                    --container-name "packerlogs" `
+                    @authArgs `
+                    --query "[?ends_with(name, 'customization.log')].name" -o tsv 2>$null
+
+                  if ([string]::IsNullOrWhiteSpace($blobs)) {
+                    Write-Host "    No customization.log found in packerlogs container."
+                    return $false
+                  }
+
+                  foreach ($blobName in ($blobs -split "`n" | Where-Object { $_ })) {
+                    Write-Host ""
+                    Write-Host "##[section]======== customization.log ($StorageAccount/$blobName) ========"
+                    Write-Host ""
+
+                    $tempFile = Join-Path $env:TEMP "customization_$(Get-Random).log"
+                    az storage blob download `
+                      --account-name $StorageAccount `
+                      --container-name "packerlogs" `
+                      --name $blobName `
+                      --file $tempFile `
+                      @authArgs `
+                      --no-progress 2>$null
+
+                    if (Test-Path $tempFile) {
+                      $content = Get-Content $tempFile -Raw
+                      $lines = $content -split "`n"
+                      if ($lines.Count -gt 200) {
+                        Write-Host "... (showing last 200 of $($lines.Count) lines) ..."
+                        Write-Host ""
+                        ($lines | Select-Object -Last 200) | ForEach-Object { Write-Host $_ }
+                      } else {
+                        Write-Host $content
+                      }
+
+                      $artifactDir = Join-Path $env:BUILD_ARTIFACTSTAGINGDIRECTORY "packer-logs"
+                      New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+                      Copy-Item $tempFile (Join-Path $artifactDir "customization.log")
+                      Write-Host ""
+                      Write-Host "##vso[artifact.upload artifactname=PackerLogs]$artifactDir"
+                      Write-Host "Full log published as pipeline artifact: PackerLogs/customization.log"
+
+                      Remove-Item $tempFile -Force 2>$null
+                      return $true
+                    } else {
+                      Write-Host "##vso[task.logissue type=warning]Failed to download customization.log from $StorageAccount"
+                    }
+                  }
+                  return $false
+                }
+
+                Write-Host "##[section]Retrieving Packer build logs for: $imageTemplateName"
+
+                # ── Step 1: Get the lastRunStatus message which contains the staging RG/storage path ──
+                $statusJson = az image builder show `
+                  --name "$imageTemplateName" `
+                  --resource-group "$galleryRg" `
+                  --query "lastRunStatus" -o json 2>$null
+
+                if ([string]::IsNullOrWhiteSpace($statusJson) -or $statusJson -eq 'null') {
+                  $statusJson = az image builder show `
+                    --name "$imageTemplateName" `
+                    --resource-group "$galleryRg" `
+                    --query "properties.lastRunStatus" -o json 2>$null
+                }
+
+                $errorMessage = ''
+                if (-not [string]::IsNullOrWhiteSpace($statusJson) -and $statusJson -ne 'null') {
+                  $statusObj = $statusJson | ConvertFrom-Json
+                  $errorMessage = $statusObj.message
+                  Write-Host "Build status : $($statusObj.runState)"
+                  Write-Host "Sub-status   : $($statusObj.runSubState)"
+                  Write-Host "Message      : $errorMessage"
+                  Write-Host ""
+                }
+
+                # ── Step 2: Try the exact storage account / RG from the AIB error message first ──
+                # The error message contains the full resource ID of the storage account.
+                # Parse it to attempt a direct download before falling back to a broad scan.
+                if ($errorMessage -match '/resourceGroups/([^/]+)/providers/Microsoft.Storage/storageAccounts/([^/]+)/') {
+                  $directRg = $Matches[1]
+                  $directSa = $Matches[2]
+                  Write-Host "##[section]Attempting direct download from storage account referenced in error message"
+                  Write-Host "  Resource Group : $directRg"
+                  Write-Host "  Storage Account: $directSa"
+
+                  # The storage account lives in sub-avd-images-* (may differ from the SPN default subscription)
+                  if ($errorMessage -match '/subscriptions/([^/]+)/') {
+                    $storageSub = $Matches[1]
+                    az account set --subscription $storageSub 2>$null
+                  }
+
+                  $logFound = Get-PackerLog -StorageAccount $directSa -StorageRg $directRg
+
+                  # Switch back to the pipeline subscription for the broad scan
+                  az account set --subscription "$(subscriptionName)" 2>$null
+                }
+
+                # ── Step 3: Broad scan of all AIB staging resource groups (fallback) ──
+                if (-not $logFound) {
+                  Write-Host ""
+                  Write-Host "##[section]Scanning all AIB staging resource groups..."
+
+                  $subscriptionId = az account show --query "id" -o tsv
+                  $stagingRgs = az group list `
+                    --query "[?starts_with(name, 'IT_${galleryRg}_')].name" -o tsv 2>$null
+
+                  if ([string]::IsNullOrWhiteSpace($stagingRgs)) {
+                    Write-Host "##vso[task.logissue type=warning]No AIB staging resource group found matching pattern 'IT_${galleryRg}_*'. It may have been cleaned up already."
+                    Write-Host "Check the error message above for the full storage path and download manually."
+                    exit 0
+                  }
+
+                  foreach ($stagingRg in ($stagingRgs -split "`n" | Where-Object { $_ })) {
+                    if ($logFound) { break }
+                    Write-Host "##[section]Scanning staging RG: $stagingRg"
+
+                    $storageAccounts = az storage account list `
+                      --resource-group "$stagingRg" `
+                      --query "[].name" -o tsv 2>$null
+
+                    foreach ($sa in ($storageAccounts -split "`n" | Where-Object { $_ })) {
+                      Write-Host "  Storage account: $sa"
+                      $logFound = Get-PackerLog -StorageAccount $sa -StorageRg $stagingRg
+                      if ($logFound) { break }
+                    }
+                  }
+                }
+
+                Write-Host ""
+                if ($logFound) {
+                  Write-Host "##[section]Troubleshooting complete. Review the log output above for the root cause."
+                } else {
+                  Write-Host "##[section]Could not retrieve customization.log from any staging storage account."
+                  Write-Host ""
+                  Write-Host "Possible reasons:"
+                  Write-Host "  1. The AIB staging resource group was already cleaned up"
+                  Write-Host "  2. The log has not been flushed to blob storage yet"
+                  Write-Host "  3. The build failed before Packer started (e.g. ARM deployment error)"
+                  Write-Host ""
+                  Write-Host "Manual retrieval: use the storage path from the error message above and"
+                  Write-Host "download via Azure Portal or: az storage blob download --account-name <sa> --container-name packerlogs --name <guid>/customization.log --file customization.log --account-key <key>"
+                }
+
+          - task: AzureCLI@2
+            displayName: "Cleanup AIB Template"
+            condition: succeeded()
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                $imageTemplateName = "$(deployTemplate.imageTemplateName)"
+
+                if (-not [string]::IsNullOrEmpty($imageTemplateName)) {
+                  Write-Host "##[section]Cleaning up AIB template: $imageTemplateName"
+
+                  az image builder delete `
+                    --name "$imageTemplateName" `
+                    --resource-group "${{ parameters.galleryResourceGroup }}" 2>$null
+
+                  if ($LASTEXITCODE -eq 0) {
+                    Write-Host "[OK] AIB template deleted: $imageTemplateName"
+                  } else {
+                    Write-Host "##vso[task.logissue type=warning]Could not delete AIB template. Manual cleanup may be needed."
+                  }
+                }
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 4b – Capture VM Image                             │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: CaptureVMImage_${{ parameters.deploymentIdentifier }}
+    displayName: 'Capture VM Image'
+    condition: and(succeeded(), eq('${{ parameters.buildAction }}', 'captureVM'))
+    dependsOn:
+      - Validate_${{ parameters.deploymentIdentifier }}
+      - DeployImageDefinition_${{ parameters.deploymentIdentifier }}
+    variables:
+      imageVersion: $[ stageDependencies.Validate_${{ parameters.deploymentIdentifier }}.ValidateInputs.outputs['validation.imageVersion'] ]
+    jobs:
+      - job: CaptureImage
+        displayName: 'Capture VM as Gallery Image'
+        timeoutInMinutes: 180
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Run Image Capture Automation"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Stop'
+
+                az account set --subscription "$(subscriptionName)"
+
+                $subscriptionId = az account show --query "id" -o tsv 2>$null
+                $captureVMName = "${{ parameters.captureVMName }}"
+                $captureVMRG = "${{ parameters.captureVMResourceGroup }}"
+
+                if ($captureVMName -eq 'none' -or [string]::IsNullOrEmpty($captureVMName) -or $captureVMRG -eq 'none' -or [string]::IsNullOrEmpty($captureVMRG)) {
+                  Write-Host "##vso[task.logissue type=error]'captureVMName' and 'captureVMResourceGroup' parameters are required for VM capture mode."
+                  exit 1
+                }
+
+                Write-Host "##[section]Capturing VM Image"
+                Write-Host "VM: $captureVMName"
+                Write-Host "Resource Group: $captureVMRG"
+                Write-Host "Target Gallery: ${{ parameters.galleryName }}"
+                Write-Host "Image Definition: ${{ parameters.imageDefinitionName }}"
+                Write-Host "Image Version: $(imageVersion)"
+
+                # Parse replication regions
+                $regions = "${{ parameters.replicationRegions }}" -split ',' | ForEach-Object { $_.Trim() }
+
+                # Run the image capture script
+                $scriptPath = "$(System.DefaultWorkingDirectory)/Scripts/ImageCapture/ImageCaptureAutomation.ps1"
+
+                if (-not (Test-Path $scriptPath)) {
+                  Write-Host "##vso[task.logissue type=error]Image capture script not found: $scriptPath"
+                  exit 1
+                }
+
+                $captureParams = @{
+                  SubscriptionId           = $subscriptionId
+                  ResourceGroupName        = $captureVMRG
+                  VMName                   = $captureVMName
+                  GalleryResourceGroupName = "${{ parameters.galleryResourceGroup }}"
+                  GalleryName              = "${{ parameters.galleryName }}"
+                  ImageDefinitionName      = "${{ parameters.imageDefinitionName }}"
+                  ImageVersionName         = "$(imageVersion)"
+                  TargetRegions            = $regions
+                  ReplicaCount             = 1
+                  OsState                  = 'Generalized'
+                  EndOfLifeDate            = (Get-Date).AddYears(1)
+                  Tags                     = @{
+                    environment = "${{ parameters.environment }}"
+                    workload    = "avd"
+                    managedBy   = "pipeline"
+                    buildId     = "$(Build.BuildId)"
+                    buildNumber = "$(Build.BuildNumber)"
+                    requestedBy = "$(Build.RequestedFor)"
+                    capturedAt  = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                  }
+                  Force                    = $true
+                }
+
+                if ('${{ parameters.deleteSourceVMAfterCapture }}' -eq 'True') {
+                  $captureParams['DeleteSourceVM'] = $true
+                }
+
+                & $scriptPath @captureParams
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Image capture failed."
+                  exit 1
+                }
+
+                Write-Host ""
+                Write-Host "##[section]VM image captured successfully!"
+                Write-Host "Image Version: $(imageVersion)"
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 5 – Verify Image                                  │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: VerifyImage_${{ parameters.deploymentIdentifier }}
+    displayName: 'Verify Image Version'
+    dependsOn:
+      - Validate_${{ parameters.deploymentIdentifier }}
+      - ${{ if eq(parameters.buildAction, 'imageBuilder') }}:
+        - RunImageBuilder_${{ parameters.deploymentIdentifier }}
+      - ${{ if eq(parameters.buildAction, 'captureVM') }}:
+        - CaptureVMImage_${{ parameters.deploymentIdentifier }}
+    variables:
+      imageVersion: $[ stageDependencies.Validate_${{ parameters.deploymentIdentifier }}.ValidateInputs.outputs['validation.imageVersion'] ]
+    jobs:
+      - job: Verify
+        displayName: 'Verify Image & Replication'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Verify Image Version"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                # Verify correct subscription
+                $currentSub = az account show --query "{name:name, id:id}" -o json | ConvertFrom-Json
+                Write-Host "Active subscription: $($currentSub.name) ($($currentSub.id))"
+                if ($currentSub.name -ne "$(subscriptionName)") {
+                  Write-Host "##vso[task.logissue type=warning]Expected subscription '$(subscriptionName)' but got '$($currentSub.name)'. Retrying with subscription ID..."
+                  $targetSub = az account list --query "[?name=='$(subscriptionName)'].id" -o tsv 2>$null
+                  if (-not [string]::IsNullOrWhiteSpace($targetSub)) {
+                    az account set --subscription "$targetSub"
+                    $currentSub = az account show --query "{name:name, id:id}" -o json | ConvertFrom-Json
+                    Write-Host "Switched to subscription: $($currentSub.name) ($($currentSub.id))"
+                  } else {
+                    Write-Host "##vso[task.logissue type=error]Could not find subscription '$(subscriptionName)'."
+                    exit 1
+                  }
+                }
+
+                Write-Host "##[section]Verifying Image Version"
+                Write-Host "Gallery: ${{ parameters.galleryName }}"
+                Write-Host "Image Definition: ${{ parameters.imageDefinitionName }}"
+                Write-Host "Expected Version: $(imageVersion)"
+
+                # List existing versions for diagnostics
+                Write-Host ""
+                Write-Host "Existing versions in '${{ parameters.imageDefinitionName }}':"
+                $existingVersions = az sig image-version list `
+                  --gallery-name "${{ parameters.galleryName }}" `
+                  --gallery-image-definition "${{ parameters.imageDefinitionName }}" `
+                  --resource-group "${{ parameters.galleryResourceGroup }}" `
+                  --query "[].{name:name, provisioningState:provisioningState}" -o table 2>$null
+                if ($existingVersions) {
+                  $existingVersions | ForEach-Object { Write-Host "  $_" }
+                } else {
+                  Write-Host "  (none found)"
+                }
+                Write-Host ""
+
+                # Wait for image version to become available (replication can take 10-20+ minutes)
+                $maxRetries = 30
+                $retryDelaySec = 60
+                $versionInfo = $null
+
+                for ($i = 1; $i -le $maxRetries; $i++) {
+                  $versionInfo = az sig image-version show `
+                    --gallery-name "${{ parameters.galleryName }}" `
+                    --gallery-image-definition "${{ parameters.imageDefinitionName }}" `
+                    --gallery-image-version "$(imageVersion)" `
+                    --resource-group "${{ parameters.galleryResourceGroup }}" 2>$null
+
+                  if ($versionInfo) {
+                    Write-Host "[OK] Image version found on attempt $i."
+                    break
+                  }
+
+                  if ($i -lt $maxRetries) {
+                    Write-Host "Image version not yet available (attempt $i/$maxRetries). Waiting ${retryDelaySec}s..."
+                    Start-Sleep -Seconds $retryDelaySec
+                  }
+                }
+
+                if (-not $versionInfo) {
+                  Write-Host "##vso[task.logissue type=error]Image version '$(imageVersion)' not found in definition '${{ parameters.imageDefinitionName }}' after $maxRetries attempts ($([math]::Round($maxRetries * $retryDelaySec / 60)) min)."
+                  Write-Host ""
+
+                  # Diagnostic: search all definitions in the gallery for this version
+                  Write-Host "##[section]Diagnostic: searching all image definitions for version '$(imageVersion)'..."
+                  $allDefs = az sig image-definition list `
+                    --gallery-name "${{ parameters.galleryName }}" `
+                    --resource-group "${{ parameters.galleryResourceGroup }}" `
+                    --query "[].name" -o tsv 2>$null
+                  $foundElsewhere = $false
+                  if ($allDefs) {
+                    foreach ($def in $allDefs) {
+                      $check = az sig image-version show `
+                        --gallery-name "${{ parameters.galleryName }}" `
+                        --gallery-image-definition "$def" `
+                        --gallery-image-version "$(imageVersion)" `
+                        --resource-group "${{ parameters.galleryResourceGroup }}" `
+                        --query "name" -o tsv 2>$null
+                      if ($check) {
+                        Write-Host "  [!] Version '$(imageVersion)' EXISTS in definition '$def' (not in '${{ parameters.imageDefinitionName }}')"
+                        $foundElsewhere = $true
+                      }
+                    }
+                  }
+                  if (-not $foundElsewhere) {
+                    Write-Host "  Version '$(imageVersion)' was not found in any image definition."
+                    Write-Host "  The AIB build may have completed but failed to distribute the image."
+                  }
+
+                  exit 1
+                }
+
+                $versionData = $versionInfo | ConvertFrom-Json
+
+                Write-Host "##[section]Image Version Details"
+                Write-Host "  Name              : $($versionData.name)"
+                Write-Host "  ID                : $($versionData.id)"
+
+                # Handle both flattened (modern az CLI) and nested (older az CLI) property paths
+                $provState = if ($versionData.provisioningState) { $versionData.provisioningState } else { $versionData.properties.provisioningState }
+                $targetRegions = if ($versionData.publishingProfile.targetRegions) { $versionData.publishingProfile.targetRegions } else { $versionData.properties.publishingProfile.targetRegions }
+                $replState = if ($versionData.replicationStatus.aggregatedState) { $versionData.replicationStatus.aggregatedState } else { $versionData.properties.replicationStatus.aggregatedState }
+
+                Write-Host "  Provisioning State: $provState"
+                Write-Host "  Replication Status :"
+
+                if ($targetRegions) {
+                  foreach ($region in $targetRegions) {
+                    Write-Host "    - $($region.name): $($region.regionalReplicaCount) replica(s), $($region.storageAccountType)"
+                  }
+                }
+
+                Write-Host ""
+                Write-Host "  Aggregated Replication State: $replState"
+
+                if ($provState -ne 'Succeeded') {
+                  Write-Host "##vso[task.logissue type=warning]Image provisioning state is '$provState', expected 'Succeeded'."
+                }
+
+                $imageVersionId = $versionData.id
+                Write-Host ""
+                Write-Host "##[section]Image verification complete"
+                Write-Host ""
+                Write-Host "##[section]Image Resource ID (for use in host pool deployments):"
+                Write-Host "$imageVersionId"
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 6 – Summary                                       │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: Summary_${{ parameters.deploymentIdentifier }}
+    displayName: 'Build Summary'
+    dependsOn:
+      - VerifyImage_${{ parameters.deploymentIdentifier }}
+      - Validate_${{ parameters.deploymentIdentifier }}
+    condition: always()
+    variables:
+      imageVersion: $[ stageDependencies.Validate_${{ parameters.deploymentIdentifier }}.ValidateInputs.outputs['validation.imageVersion'] ]
+    jobs:
+      - job: PrintSummary
+        displayName: 'Print Build Summary'
+        steps:
+          - script: |
+              echo "=============================================="
+              echo " AVD Image Build Summary"
+              echo "=============================================="
+              echo " Environment       : ${{ parameters.environment }}"
+              echo " Gallery           : ${{ parameters.galleryName }}"
+              echo " Image Definition  : ${{ parameters.imageDefinitionName }}"
+              echo " Image Version     : $(imageVersion)"
+              echo " Image Type        : ${{ parameters.imageType }}"
+              echo " Build Method      : ${{ parameters.buildAction }}"
+              echo " Source             : ${{ parameters.sourcePublisher }}/${{ parameters.sourceOffer }}/${{ parameters.sourceSku }}:${{ parameters.sourceVersion }}"
+              echo " Replication       : ${{ parameters.replicationRegions }}"
+              echo " Build ID          : $(Build.BuildId)"
+              echo " Build Number      : $(Build.BuildNumber)"
+              echo " Requested By      : $(Build.RequestedFor)"
+              echo " Timestamp         : $(date)"
+              echo "=============================================="
+            displayName: "Print Summary"

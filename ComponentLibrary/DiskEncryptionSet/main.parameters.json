@@ -1,0 +1,34 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "diskEncryptionSetName": {
+            "value": ""
+        },
+        "userAssignedIdentityId": {
+            "value": ""
+        },
+        "keyUrl": {
+            "value": ""
+        },
+        "tags": {
+            "value": {
+                "app": "avd",
+                "environment": "prd",
+                "importance": "high",
+                "product": "avd",
+                "team": "cloudplatformgovernance",
+                "applicationowner": "cloudplatformgovernance",
+                "application": "avd",
+                "businessdomain": "it",
+                "activeworkinghours": "8-18",
+                "activeworkingdays": "1-5",
+                "startstopenabled": "false",
+                "owner": "cloudplatformgovernance",
+                "component": "ConfidentialCompute",
+                "purpose": "DiskEncryptionSet",
+                "hostpool": ""
+            }
+        }
+    }
+}

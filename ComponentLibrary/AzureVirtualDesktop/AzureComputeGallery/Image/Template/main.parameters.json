@@ -1,0 +1,78 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": ""
+    },
+    "replicationRegions": {
+      "value": []
+    },
+    "galleryName": {
+      "value": ""
+    },
+    "imageDefinitionName": {
+      "value": ""
+    },
+    "imageTemplateName": {
+      "value": ""
+    },
+    "userAssignedIdentityId": {
+      "value": ""
+    },
+    "sourcePublisher": {
+      "value": "microsoftwindowsdesktop"
+    },
+    "sourceOffer": {
+      "value": ""
+    },
+    "sourceSku": {
+      "value": ""
+    },
+    "sourceType": {
+      "value": "PlatformImage"
+    },
+    "sourceVersion": {
+      "value": "latest"
+    },
+    "vmSize": {
+      "value": "Standard_D8as_v5"
+    },
+    "osDiskSizeGB": {
+      "value": 127
+    },
+    "buildTimeoutInMinutes": {
+      "value": 960
+    },
+    "imageVersionNumber": {
+      "value": "0.0.1"
+    },
+    "storageAccountType": {
+      "value": "Standard_ZRS"
+    },
+    "languageList": {
+      "value": "\"English (United States)\""
+    },
+    "defaultLanguage": {
+      "value": "\"English (United States)\""
+    },
+    "enableRdpShortpath": {
+      "value": false
+    },
+    "enableDotNet9": {
+      "value": false
+    },
+    "enableRemoveOfficeApps": {
+      "value": false
+    },
+    "enableRemoveOneDrive": {
+      "value": false
+    },
+    "enableDisableAutoUpdates": {
+      "value": false
+    },
+    "tags": {
+      "value": {}
+    }
+  }
+}

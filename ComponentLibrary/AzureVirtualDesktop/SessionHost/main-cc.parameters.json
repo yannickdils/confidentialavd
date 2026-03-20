@@ -1,0 +1,106 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "SharedImageId": {
+            "value": ""
+        },
+        "hostpoolName": {
+            "value": ""
+        },
+        "sessionHostCount": {
+            "value": 1
+        },
+        "vmSize": {
+            "value": "Standard_DC4as_v5"
+        },
+        "subnetId": {
+            "value": ""
+        },
+        "intuneEnabled": {
+            "value": false
+        },
+        "LocalAdminAccountSecretName": {
+            "value": "local-admin-user"
+        },
+        "LocalAdminPasswordSecretName": {
+            "value": "local-admin-password"
+        },
+        "secureBootEnabled": {
+            "value": true
+        },
+        "vtpmEnabled": {
+            "value": true
+        },
+        "vmNamePrefix": {
+            "value": ""
+        },
+        "userAssignedIdentityId": {
+            "value": ""
+        },
+        "DomainKeyVaultId": {
+            "value": ""
+        },
+        "LocalKeyVaultId": {
+            "value": ""
+        },
+        "domainJoinAccountSecretName": {
+            "value": "avd-domain-join-username"
+        },
+        "domainJoinPasswordSecretName": {
+            "value": "avd-domain-join-password"
+        },
+        "AADJoin": {
+            "value": false
+        },
+        "domain": {
+            "value": ""
+        },
+        "ouPath": {
+            "value": ""
+        },
+        "dataCollectionRuleId": {
+            "value": ""
+        },
+        "diskEncryptionSetId": {
+            "value": ""
+        },
+        "securityEncryptionType": {
+            "value": "DiskWithVMGuestState"
+        },
+        "osDiskStorageAccountType": {
+            "value": "Premium_LRS"
+        },
+        "osDiskSizeGB": {
+            "value": 128
+        },
+        "imagePublisher": {
+            "value": "microsoftwindowsdesktop"
+        },
+        "imageOffer": {
+            "value": "office-365"
+        },
+        "imageSku": {
+            "value": "win11-25h2-avd-m365"
+        },
+        "imageVersion": {
+            "value": "latest"
+        },
+        "tags": {
+            "value": {
+                "businessdomain": "ItForEndUsers",
+                "environment": "prd",
+                "importance": "critical",
+                "product": "InfraStore",
+                "team": "WIN-SYS",
+                "applicationowner": "<APPLICATION_OWNER_EMAIL>",
+                "app": "avd",
+                "application": "avd",
+                "activeworkinghours": "24x7",
+                "activeworkingdays": "fw",
+                "startstopenabled": "false",
+                "owner": "<OWNER_EMAIL>"
+            }
+        }
+    }
+}

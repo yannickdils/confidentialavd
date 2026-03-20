@@ -1,0 +1,396 @@
+# ============================================================
+# AVD Gallery Infrastructure Pipeline
+# ============================================================
+# Deploys the Azure Compute Gallery infrastructure:
+#   1. User-Assigned Managed Identity (for AIB)
+#   2. Azure Compute Gallery
+#   3. Image Definitions (standard, CC, PAW, RPA)
+#
+# Uses the orchestrator:
+#   Environments/sub-avd-images-{env}/images/AzureComputeGallery/main.bicep
+#
+# Prerequisites:
+#   - Resource group must already exist
+#   - Service connection with Contributor on the images subscription
+# ============================================================
+
+trigger:
+- none
+
+pool:
+  name: ${{ parameters.agentPool }}
+
+# ── Parameters ─────────────────────────────────────────────────
+
+parameters:
+  - name: agentPool
+    type: string
+    default: '<AGENT_POOL_NAME>'
+    displayName: "Agent pool name"
+
+  - name: serviceConnectionPrd
+    type: string
+    default: '<SERVICE_CONNECTION_PRD>'
+    displayName: "Azure DevOps service connection (production)"
+
+  - name: serviceConnectionDev
+    type: string
+    default: '<SERVICE_CONNECTION_DEV>'
+    displayName: "Azure DevOps service connection (development)"
+
+  - name: approvalEnvironmentPrd
+    type: string
+    default: '<APPROVAL_ENVIRONMENT_PRD>'
+    displayName: "Azure DevOps approval environment (production)"
+
+  - name: approvalEnvironmentDev
+    type: string
+    default: '<APPROVAL_ENVIRONMENT_DEV>'
+    displayName: "Azure DevOps approval environment (development)"
+
+  - name: environment
+    type: string
+    default: 'prd'
+    displayName: "Target environment"
+    values:
+      - dev
+      - prd
+
+  - name: resourceGroup
+    type: string
+    default: 'rg-avd-images-prd-image-weu-001'
+    displayName: "Resource group for gallery resources"
+
+  - name: location
+    type: string
+    default: 'westeurope'
+    displayName: "Azure region (used for RG creation if needed)"
+
+  - name: deploymentMode
+    type: string
+    default: 'whatIf'
+    displayName: "Deployment mode"
+    values:
+      - whatIf
+      - deploy
+
+  - name: deploymentIdentifier
+    type: string
+    default: 'gallery'
+    displayName: "Unique deployment identifier"
+
+# ── Variables ──────────────────────────────────────────────────
+
+variables:
+  - name: subscriptionName
+    ${{ if eq(parameters.environment, 'prd') }}:
+      value: 'sub-avd-images-prd'
+    ${{ else }}:
+      value: 'sub-avd-images-dev'
+  - name: serviceConnection
+    ${{ if eq(parameters.environment, 'prd') }}:
+      value: ${{ parameters.serviceConnectionPrd }}
+    ${{ else }}:
+      value: ${{ parameters.serviceConnectionDev }}
+  - name: approvalEnvironment
+    ${{ if eq(parameters.environment, 'prd') }}:
+      value: ${{ parameters.approvalEnvironmentPrd }}
+    ${{ else }}:
+      value: ${{ parameters.approvalEnvironmentDev }}
+  - name: orchestratorPath
+    value: 'Environments/sub-avd-images-${{ parameters.environment }}/images/AzureComputeGallery'
+
+# ── Stages ─────────────────────────────────────────────────────
+
+stages:
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 1 – Approval Gate                                 │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: ApprovalGate_${{ parameters.deploymentIdentifier }}
+    displayName: 'Approval Gate'
+    jobs:
+      - deployment: galleryApproval
+        displayName: "Approval Gate for Gallery Infrastructure"
+        environment: $(approvalEnvironment)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 2 – Validate                                      │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: Validate_${{ parameters.deploymentIdentifier }}
+    displayName: 'Validate Infrastructure'
+    dependsOn: ApprovalGate_${{ parameters.deploymentIdentifier }}
+    condition: succeeded('ApprovalGate_${{ parameters.deploymentIdentifier }}')
+    jobs:
+      - job: ValidateTemplate
+        displayName: 'Validate Bicep & Preflight'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Validate Orchestrator Template"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                $templateFile = "$(System.DefaultWorkingDirectory)/$(orchestratorPath)/main.bicep"
+                $paramFile = "$(System.DefaultWorkingDirectory)/$(orchestratorPath)/main.bicepparam"
+
+                Write-Host "##[section]Validating Gallery Infrastructure"
+                Write-Host "Template:   $templateFile"
+                Write-Host "Parameters: $paramFile"
+                Write-Host "Resource Group: ${{ parameters.resourceGroup }}"
+                Write-Host "Environment: ${{ parameters.environment }}"
+
+                if (-not (Test-Path $templateFile)) {
+                  Write-Host "##vso[task.logissue type=error]Orchestrator template not found: $templateFile"
+                  exit 1
+                }
+
+                if (-not (Test-Path $paramFile)) {
+                  Write-Host "##vso[task.logissue type=error]Parameter file not found: $paramFile"
+                  exit 1
+                }
+
+                # Ensure resource group exists (create if missing)
+                $rgExists = az group exists --name "${{ parameters.resourceGroup }}" -o tsv 2>$null
+                if ($rgExists -ne "true") {
+                  Write-Host "Resource group '${{ parameters.resourceGroup }}' does not exist. Creating..."
+                  az group create `
+                    --name "${{ parameters.resourceGroup }}" `
+                    --location "${{ parameters.location }}" `
+                    --tags environment="${{ parameters.environment }}" workload="avd-images" managedBy="pipeline"
+
+                  if ($LASTEXITCODE -ne 0) {
+                    Write-Host "##vso[task.logissue type=error]Failed to create resource group '${{ parameters.resourceGroup }}'."
+                    exit 1
+                  }
+                  Write-Host "✅ Resource group created in ${{ parameters.location }}"
+                } else {
+                  Write-Host "✅ Resource group already exists"
+                }
+
+                # Run preflight validation
+                Write-Host "##[section]Running preflight validation..."
+                az deployment group validate `
+                  --resource-group "${{ parameters.resourceGroup }}" `
+                  --template-file "$templateFile" `
+                  --parameters "$paramFile"
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Preflight validation failed."
+                  exit 1
+                }
+
+                Write-Host "##[section]✅ Validation passed"
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 3 – What-If                                       │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: WhatIf_${{ parameters.deploymentIdentifier }}
+    displayName: 'What-If Analysis'
+    dependsOn: Validate_${{ parameters.deploymentIdentifier }}
+    condition: succeeded('Validate_${{ parameters.deploymentIdentifier }}')
+    jobs:
+      - job: WhatIfAnalysis
+        displayName: 'Run What-If'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "What-If Deployment"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                $templateFile = "$(System.DefaultWorkingDirectory)/$(orchestratorPath)/main.bicep"
+                $paramFile = "$(System.DefaultWorkingDirectory)/$(orchestratorPath)/main.bicepparam"
+
+                Write-Host "##[section]Running What-If Analysis"
+
+                az deployment group what-if `
+                  --resource-group "${{ parameters.resourceGroup }}" `
+                  --template-file "$templateFile" `
+                  --parameters "$paramFile" `
+                  --result-format FullResourcePayloads
+
+                Write-Host ""
+                Write-Host "##[section]What-If analysis complete. Review the changes above."
+
+                if ("${{ parameters.deploymentMode }}" -eq "whatIf") {
+                  Write-Host ""
+                  Write-Host "##[section]ℹ️ Deployment mode is 'whatIf' - no changes will be applied."
+                  Write-Host "Re-run this pipeline with deploymentMode = 'deploy' to apply changes."
+                }
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 4 – Deploy                                        │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: Deploy_${{ parameters.deploymentIdentifier }}
+    displayName: 'Deploy Gallery Infrastructure'
+    dependsOn: WhatIf_${{ parameters.deploymentIdentifier }}
+    condition: and(succeeded('WhatIf_${{ parameters.deploymentIdentifier }}'), eq('${{ parameters.deploymentMode }}', 'deploy'))
+    jobs:
+      - job: DeployInfrastructure
+        displayName: 'Deploy Orchestrator'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Deploy Gallery Infrastructure"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                $templateFile = "$(System.DefaultWorkingDirectory)/$(orchestratorPath)/main.bicep"
+                $paramFile = "$(System.DefaultWorkingDirectory)/$(orchestratorPath)/main.bicepparam"
+
+                Write-Host "##[section]Deploying Gallery Infrastructure"
+                Write-Host "Template:       $templateFile"
+                Write-Host "Parameters:     $paramFile"
+                Write-Host "Resource Group: ${{ parameters.resourceGroup }}"
+                Write-Host "Subscription:   $(subscriptionName)"
+
+                $deploymentName = "Deploy-GalleryInfra-$(Build.BuildId)"
+
+                $result = az deployment group create `
+                  --resource-group "${{ parameters.resourceGroup }}" `
+                  --name "$deploymentName" `
+                  --template-file "$templateFile" `
+                  --parameters "$paramFile" `
+                  --mode Incremental
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Gallery infrastructure deployment failed."
+                  exit 1
+                }
+
+                $output = $result | ConvertFrom-Json
+
+                Write-Host ""
+                Write-Host "##[section]✅ Gallery Infrastructure deployed successfully"
+                Write-Host ""
+                Write-Host "Deployment Name: $deploymentName"
+                Write-Host "Provisioning State: $($output.properties.provisioningState)"
+
+                # Display outputs
+                if ($output.properties.outputs) {
+                  Write-Host ""
+                  Write-Host "##[section]Deployment Outputs"
+
+                  if ($output.properties.outputs.managedIdentityId) {
+                    Write-Host "  Managed Identity ID:           $($output.properties.outputs.managedIdentityId.value)"
+                  }
+                  if ($output.properties.outputs.managedIdentityPrincipalId) {
+                    Write-Host "  Managed Identity Principal ID: $($output.properties.outputs.managedIdentityPrincipalId.value)"
+                  }
+                  if ($output.properties.outputs.galleryMainId) {
+                    Write-Host "  Gallery ID:                    $($output.properties.outputs.galleryMainId.value)"
+                  }
+                }
+
+  # ┌──────────────────────────────────────────────────────────┐
+  # │  Stage 5 – Verify                                        │
+  # └──────────────────────────────────────────────────────────┘
+  - stage: Verify_${{ parameters.deploymentIdentifier }}
+    displayName: 'Verify Deployment'
+    dependsOn: Deploy_${{ parameters.deploymentIdentifier }}
+    condition: succeeded('Deploy_${{ parameters.deploymentIdentifier }}')
+    jobs:
+      - job: VerifyResources
+        displayName: 'Verify Gallery Resources'
+        steps:
+          - task: AzureCLI@2
+            displayName: "Verify Gallery & Image Definitions"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Continue'
+                $WarningPreference = 'SilentlyContinue'
+                $env:AZURE_CORE_COLLECT_TELEMETRY = "false"
+
+                az account set --subscription "$(subscriptionName)"
+
+                Write-Host "##[section]Verifying Gallery Resources"
+                Write-Host ""
+
+                # List galleries in the resource group
+                $galleries = az sig list `
+                  --resource-group "${{ parameters.resourceGroup }}" `
+                  --query "[].{name:name, location:location, id:id}" -o json 2>$null | ConvertFrom-Json
+
+                if (-not $galleries -or $galleries.Count -eq 0) {
+                  Write-Host "##vso[task.logissue type=error]No galleries found in resource group '${{ parameters.resourceGroup }}'."
+                  exit 1
+                }
+
+                foreach ($gallery in $galleries) {
+                  Write-Host "##[section]Gallery: $($gallery.name)"
+                  Write-Host "  Location: $($gallery.location)"
+                  Write-Host "  ID:       $($gallery.id)"
+                  Write-Host ""
+
+                  # List image definitions in this gallery
+                  $imageDefs = az sig image-definition list `
+                    --gallery-name "$($gallery.name)" `
+                    --resource-group "${{ parameters.resourceGroup }}" `
+                    --query "[].{name:name, osType:osType, osState:osState, securityType:features[?name=='SecurityType'].value | [0]}" -o json 2>$null | ConvertFrom-Json
+
+                  if ($imageDefs -and $imageDefs.Count -gt 0) {
+                    Write-Host "  Image Definitions:"
+                    foreach ($imgDef in $imageDefs) {
+                      $secType = if ($imgDef.securityType) { $imgDef.securityType } else { "Standard" }
+                      Write-Host "    ✅ $($imgDef.name) | OS: $($imgDef.osType) | State: $($imgDef.osState) | Security: $secType"
+                    }
+                  } else {
+                    Write-Host "  ⚠️ No image definitions found in gallery."
+                  }
+                  Write-Host ""
+                }
+
+                # Verify managed identity
+                Write-Host "##[section]Managed Identities"
+                $identities = az identity list `
+                  --resource-group "${{ parameters.resourceGroup }}" `
+                  --query "[].{name:name, principalId:principalId, clientId:clientId}" -o json 2>$null | ConvertFrom-Json
+
+                if ($identities -and $identities.Count -gt 0) {
+                  foreach ($id in $identities) {
+                    Write-Host "  ✅ $($id.name)"
+                    Write-Host "    Principal ID: $($id.principalId)"
+                    Write-Host "    Client ID:    $($id.clientId)"
+                  }
+                } else {
+                  Write-Host "  ⚠️ No managed identities found."
+                }
+
+                Write-Host ""
+                Write-Host "##[section]✅ Verification complete"
