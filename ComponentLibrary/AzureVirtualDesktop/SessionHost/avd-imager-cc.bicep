@@ -42,14 +42,13 @@ param imageVersion string = ''
 @description('Resource ID of the Shared Image Gallery image version (optional - if provided, overrides marketplace image parameters)')
 param SharedImageId string = ''
 
-@description('Resource ID of the Disk Encryption Set backed by Managed HSM for confidential compute disk encryption')
-param diskEncryptionSetId string
+@description('Resource ID of the Disk Encryption Set backed by Managed HSM (required for CMK, leave empty for PMK)')
+param diskEncryptionSetId string = ''
 
-@description('Security encryption type for confidential compute OS disk. Use DiskWithVMGuestState for full disk encryption with VM guest state, VMGuestStateOnly for just guest state encryption, or NonPersistedTPM for non-persisted TPM')
+@description('Security encryption type for confidential compute OS disk. Use DiskWithVMGuestState for CMK (requires DES) or VMGuestStateOnly for PMK (no DES needed)')
 @allowed([
   'DiskWithVMGuestState'
   'VMGuestStateOnly'
-  'NonPersistedTPM'
 ])
 param securityEncryptionType string = 'DiskWithVMGuestState'
 
@@ -122,14 +121,13 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-03-01' = {
         managedDisk: {
           storageAccountType: osDiskStorageAccountType
           // Security profile for confidential compute disk encryption
-          // Note: Do NOT add a top-level diskEncryptionSet here - for Confidential VMs,
-          // the DES must only be specified inside securityProfile. A top-level DES triggers
-          // standard SSE-CMK which is incompatible with ConfidentialVmEncryptedWithCustomerKey.
+          // For CMK: DES is specified inside securityProfile (not at the top level).
+          // For PMK: no DES reference needed, only securityEncryptionType.
           securityProfile: {
             securityEncryptionType: securityEncryptionType
-            diskEncryptionSet: {
+            diskEncryptionSet: !empty(diskEncryptionSetId) ? {
               id: diskEncryptionSetId
-            }
+            } : null
           }
         }
       }
@@ -150,10 +148,9 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-03-01' = {
       }
     }
     // Confidential Compute security profile
-    // Note: encryptionAtHost must be false when using ConfidentialVmEncryptedWithCustomerKey
-    // with DiskWithVMGuestState, as the DES-backed encryption handles disk protection.
+    // encryptionAtHost must be false for both DiskWithVMGuestState and VMGuestStateOnly
     securityProfile: {
-      encryptionAtHost: securityEncryptionType == 'DiskWithVMGuestState' ? false : true
+      encryptionAtHost: false
       securityType: 'ConfidentialVM'
       uefiSettings: {
         secureBootEnabled: secureBootEnabled

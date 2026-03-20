@@ -43,14 +43,13 @@ param imageVersion string = ''
 @description('Resource ID of the Shared Image Gallery image version (optional - if provided, overrides marketplace image parameters)')
 param SharedImageId string = ''
 
-@description('Resource ID of the Disk Encryption Set backed by Managed HSM for confidential compute disk encryption')
-param diskEncryptionSetId string
+@description('Resource ID of the Disk Encryption Set backed by Managed HSM (required for CMK, leave empty for PMK)')
+param diskEncryptionSetId string = ''
 
-@description('Security encryption type for confidential compute OS disk. Use DiskWithVMGuestState for full disk encryption with VM guest state, VMGuestStateOnly for just guest state encryption, or NonPersistedTPM for non-persisted TPM')
+@description('Security encryption type for confidential compute OS disk. Use DiskWithVMGuestState for CMK (requires DES) or VMGuestStateOnly for PMK (no DES needed)')
 @allowed([
   'DiskWithVMGuestState'
   'VMGuestStateOnly'
-  'NonPersistedTPM'
 ])
 param securityEncryptionType string = 'DiskWithVMGuestState'
 

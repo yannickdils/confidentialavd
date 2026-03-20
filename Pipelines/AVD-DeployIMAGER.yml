@@ -143,24 +143,14 @@ stages:
                     if ($imageType -eq 'cvm') {
                       Write-Host "##[section]Confidential Compute mode enabled"
 
-                      # Validate CC-specific parameters exist in JSON
-                      $ccParams = @("diskEncryptionSetName", "managedHsmName")
-                      $missingCcParams = @()
-                      foreach ($p in $ccParams) {
-                        $val = $jsonParams.$p
-                        if (-not $val -or $val -eq 'notinuse' -or [string]::IsNullOrWhiteSpace($val)) {
-                          $missingCcParams += $p
-                        }
+                      # DES is optional for CVM - only required for CMK, not PMK
+                      $diskEncryptionSetName = if ($jsonParams.diskEncryptionSetName -and $jsonParams.diskEncryptionSetName -ne 'notinuse') { $jsonParams.diskEncryptionSetName } else { '' }
+                      Write-Host "##vso[task.setvariable variable=diskEncryptionSetName;isOutput=true]$diskEncryptionSetName"
+                      if ([string]::IsNullOrEmpty($diskEncryptionSetName)) {
+                        Write-Host "No Disk Encryption Set configured - imager will use PMK (VMGuestStateOnly)"
+                      } else {
+                        Write-Host "Disk Encryption Set: $diskEncryptionSetName - imager will use CMK (DiskWithVMGuestState)"
                       }
-                      if ($missingCcParams.Count -gt 0) {
-                        Write-Host "##vso[task.logissue type=error]CVM mode requires the following JSON parameters to be set (not 'notinuse'):"
-                        foreach ($p in $missingCcParams) {
-                          Write-Host "##vso[task.logissue type=error]  - $p"
-                        }
-                        exit 1
-                      }
-
-                      Write-Host "##vso[task.setvariable variable=diskEncryptionSetName;isOutput=true]$($jsonParams.diskEncryptionSetName)"
 
                       # Use vmSizeCC from JSON if available, otherwise fall back to vmSize
                       $vmSizeCC = if ($jsonParams.vmSizeCC -and $jsonParams.vmSizeCC -ne 'notinuse') { $jsonParams.vmSizeCC } else { $jsonParams.vmSize }
@@ -352,7 +342,7 @@ stages:
                   }
 
                   if ([string]::IsNullOrWhiteSpace($desId)) {
-                    Write-Host "##vso[task.logissue type=error]Disk Encryption Set '$desName' not found. CVM deployment requires a valid DES."
+                    Write-Host "##vso[task.logissue type=error]Disk Encryption Set '$desName' not found. CMK deployment requires a valid DES."
                     exit 1
                   }
 
@@ -576,11 +566,14 @@ stages:
                 if ($imageType -eq 'cvm') {
                   $desId = "$(diskEncryptionSetId)"
                   if ([string]::IsNullOrWhiteSpace($desId)) {
-                    Write-Host "##vso[task.logissue type=error]CVM mode requires a Disk Encryption Set ID but none was retrieved."
-                    exit 1
+                    Write-Host "CVM: No Disk Encryption Set - using PMK (VMGuestStateOnly)"
+                    $deploymentParams["diskEncryptionSetId"] = ''
+                    $deploymentParams["securityEncryptionType"] = 'VMGuestStateOnly'
+                  } else {
+                    Write-Host "CVM: Disk Encryption Set ID: $desId - using CMK (DiskWithVMGuestState)"
+                    $deploymentParams["diskEncryptionSetId"] = $desId
+                    $deploymentParams["securityEncryptionType"] = 'DiskWithVMGuestState'
                   }
-                  $deploymentParams["diskEncryptionSetId"] = $desId
-                  Write-Host "CVM: Disk Encryption Set ID: $desId"
                 }
                 
                 # Handle tags
