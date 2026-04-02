@@ -36,7 +36,8 @@ confidentialavd/
 │   │   └── ManagedIdentity/             # User-Assigned Identity
 │   ├── DiskEncryptionSet/               # CC disk encryption (Managed HSM)
 │   ├── KeyVault/                        # Secrets management
-│   └── PrivateEndpoint/                 # Private endpoints
+│   ├── PrivateEndpoint/                 # Private endpoints
+│   └── ResourceGroup/                   # Subscription-level resource group deployment
 │
 ├── Environments/
 │   ├── sub-avd-images-prd/
@@ -51,8 +52,11 @@ confidentialavd/
 │   └── AVD-DeployIMAGER.yml             # Deploy imager VM
 │
 └── Scripts/
+    ├── CreateHSM_CMK.ps1                # Create Managed HSM key for CVM encryption
+    ├── Get-AIBPackerLog.ps1             # Retrieve AIB Packer build logs
     ├── Register-CCFeatureFlags.ps1      # Register CC feature flags
     ├── PAWImageprep.ps1                 # Pre-sysprep remediation
+    ├── Watch-AIBBuild.ps1               # Monitor AIB build progress
     ├── ImageCapture/                    # VM capture automation
     └── Sysprep/                         # Sysprep finalization
 ```

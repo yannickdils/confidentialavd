@@ -10,6 +10,7 @@ This folder contains reusable Azure Bicep modules for building Confidential VM i
 | [DiskEncryptionSet/](DiskEncryptionSet/) | Disk Encryption Set for Confidential VM encryption (Managed HSM backed) |
 | [KeyVault/](KeyVault/) | Azure Key Vault for secrets management |
 | [PrivateEndpoint/](PrivateEndpoint/) | Private endpoint configurations |
+| [ResourceGroup/](ResourceGroup/) | Subscription-level resource group deployment |
 
 ## 🖥️ Azure Virtual Desktop Modules
 
@@ -76,7 +77,7 @@ Typical deployment order for Confidential VM image build and session host deploy
 3. Image Definition      (CC image definition with TrustedLaunchAndConfidentialVmSupported)
 4. Image Template        (AIB template with DC-series build VM)
 5. Image Build           (AIB run → produces image version)
-6. DiskEncryptionSet     (Managed HSM-backed DES for CC disk encryption)
+6. DiskEncryptionSet     (Managed HSM-backed DES for CC disk encryption) — only required for CMK, skip for PMK
 7. KeyVault              (Secrets for admin credentials / domain join)
 8. SessionHost (CC)      (Confidential Compute session hosts)
 ```

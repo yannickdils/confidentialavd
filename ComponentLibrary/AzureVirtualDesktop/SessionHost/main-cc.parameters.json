@@ -88,18 +88,18 @@
         },
         "tags": {
             "value": {
-                "businessdomain": "ItForEndUsers",
-                "environment": "prd",
-                "importance": "critical",
-                "product": "InfraStore",
-                "team": "WIN-SYS",
-                "applicationowner": "<APPLICATION_OWNER_EMAIL>",
-                "app": "avd",
-                "application": "avd",
-                "activeworkinghours": "24x7",
-                "activeworkingdays": "fw",
-                "startstopenabled": "false",
-                "owner": "<OWNER_EMAIL>"
+                "businessdomain": "",
+                "environment": "",
+                "importance": "",
+                "product": "",
+                "team": "",
+                "applicationowner": "",
+                "app": "",
+                "application": "",
+                "activeworkinghours": "",
+                "activeworkingdays": "",
+                "startstopenabled": "",
+                "owner": ""
             }
         }
     }

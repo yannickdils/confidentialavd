@@ -3,10 +3,10 @@
     "contentVersion": "1.0.0.0",
     "parameters": {
         "SharedImageId": {
-            "value": "/subscriptions/<SUBSCRIPTION_ID_IMAGES_PRD>/resourcegroups/rg-avd-images-prd-image-weu-001/providers/microsoft.compute/galleries/galavdimagesprdweu001/images/imgd-avd-images-prd-cc-win11-25h2-001/versions/1.0.0"
+            "value": "/subscriptions/<SUBSCRIPTION_ID_IMAGES_PRD>/resourcegroups/rg-avd-images-prd-image-weu-001/providers/microsoft.compute/galleries/galavdimagesprdweu001/images/imgd-avd-images-prd-win/versions/1.0.0"
         },
         "vmSize": {
-            "value": "Standard_DC8as_v5"
+            "value": "Standard_D8s_v5"
         },
         "subnetId": {
             "value": "/subscriptions/<SUBSCRIPTION_ID_AVD_PRD>/resourceGroups/rg-avd-prd-hp-intcoreapps-network-weu-001/providers/Microsoft.Network/virtualNetworks/vnet-avd-hp-intcoreapps-prd-weu-001/subnets/snet-avd-hp-intcoreapps-prd-hosts"
@@ -24,25 +24,13 @@
             "value": true
         },
         "vmNamePrefix": {
-            "value": "avd-25h2-cc"
+            "value": "avd-25h2-int"
         },
         "userAssignedIdentityId": {
             "value": ""
         },
         "LocalKeyVaultId": {
             "value": ""
-        },
-        "diskEncryptionSetId": {
-            "value": ""
-        },
-        "securityEncryptionType": {
-            "value": "DiskWithVMGuestState"
-        },
-        "osDiskStorageAccountType": {
-            "value": "Premium_LRS"
-        },
-        "osDiskSizeGB": {
-            "value": 128
         },
         "imagePublisher": {
             "value": "microsoftwindowsdesktop"
@@ -64,7 +52,6 @@
                 "product": "",
                 "team": "",
                 "applicationowner": "",
-                "app": "",
                 "application": "",
                 "activeworkinghours": "",
                 "activeworkingdays": "",
