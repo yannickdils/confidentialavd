@@ -24,10 +24,10 @@ param offer string
 @description('Sku of the image definition to be created')
 param sku string
 
-@description('Name of the image definition to be created')
+@description('Maximum recommended vCPU count for VMs using this image')
 param maxCPUs int = 16
 
-@description('Name of the image definition to be created')
+@description('Maximum recommended memory in GB for VMs using this image')
 param maxMemory int = 32
 
 param tags object

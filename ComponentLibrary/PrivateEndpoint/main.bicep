@@ -9,7 +9,7 @@ param tags object
 var PEPname = 'pep-${privateEndpointName}-${targetSubResource}'
 var NICName = 'nic-${privateEndpointName}-${targetSubResource}'
 
-resource privateEndpoint 'Microsoft.Network/privateEndpoints@2021-05-01' = {
+resource privateEndpoint 'Microsoft.Network/privateEndpoints@2024-01-01' = {
   location: location
   name: PEPname
   properties: {
@@ -30,7 +30,6 @@ resource privateEndpoint 'Microsoft.Network/privateEndpoints@2021-05-01' = {
     ]
   }
   tags: tags
-  dependsOn: []
 
   resource privateEndpointDns 'privateDnsZoneGroups' = {
     name: '${PEPname}-dns'

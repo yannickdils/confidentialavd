@@ -344,7 +344,8 @@ var finalizeSteps = [
   }
 ]
 
-// Assemble all customize steps in order (matches the blog's documented sequence):
+// Assemble all customize steps in order
+// (matches the blog's documented sequence: https://www.tunecom.be/how-to-build-confidential-avd-images-with-azure-image-builder/ ):
 //  1. Timezone Redirection (always)
 //  2. Disable Storage Sense (always)
 //  3. FSLogix Profile Containers (always)

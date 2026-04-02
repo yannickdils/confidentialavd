@@ -37,9 +37,8 @@ param vtpmEnabled = true
 param diskEncryptionSetId = '/subscriptions/<subscription-id>/resourceGroups/<rg-name>/providers/Microsoft.Compute/diskEncryptionSets/<des-name>'
 
 // Security Encryption Type for Confidential Compute
-// - 'DiskWithVMGuestState': Encrypts both OS disk and VM guest state (recommended)
-// - 'VMGuestStateOnly': Encrypts only VM guest state
-// - 'NonPersistedTPM': Non-persisted TPM (no disk encryption)
+// - 'DiskWithVMGuestState': Encrypts both OS disk and VM guest state with CMK (requires DES + Managed HSM)
+// - 'VMGuestStateOnly': Platform-managed encryption of VM guest state only (no DES needed, simpler setup)
 param securityEncryptionType = 'DiskWithVMGuestState'
 
 // OS Disk Configuration

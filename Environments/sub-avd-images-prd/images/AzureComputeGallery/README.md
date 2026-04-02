@@ -112,3 +112,7 @@ az deployment group create \
 - **Storage Accounts** (prefixed with random strings) are also AIB-generated artifacts.
 - The **Managed Identity** (`umi-imgt-avd-images-prd-intcoreapps-win`) is shared across all image templates.
 - All image templates use the common customization pipeline defined in `ComponentLibrary/AzureVirtualDesktop/AzureComputeGallery/Image/Template/main.bicep`, with optional feature flags to enable/disable specific steps.
+
+## 📚 References
+
+- [📝 Blog: How to build and deploy confidential AVD images with Azure Image Builder](https://www.tunecom.be/how-to-build-confidential-avd-images-with-azure-image-builder/)

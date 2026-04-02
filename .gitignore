@@ -1,0 +1,29 @@
+# ─── Secrets & Credentials ───────────────────────────────────
+*.secret
+*.pfx
+*.key
+*.pem
+secrets.json
+local.settings.json
+
+# ─── Bicep Build Artifacts ───────────────────────────────────
+*.json.lock
+
+# ─── IDE / Editor ────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS Files ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ─── PowerShell ──────────────────────────────────────────────
+*.ps1xml
+
+# ─── Logs ────────────────────────────────────────────────────
+*.log
+logs/
