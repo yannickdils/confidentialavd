@@ -34,8 +34,10 @@ confidentialavd/
 │   │   ├── AzureComputeGallery/         # Gallery, Image Definition, Template, Version
 │   │   ├── SessionHost/                 # CC & standard session host VMs
 │   │   └── ManagedIdentity/             # User-Assigned Identity
-│   ├── DiskEncryptionSet/               # CC disk encryption (Managed HSM)
+│   ├── DiskEncryptionSet/               # CC disk encryption (Managed HSM + Key Vault variants)
+│   ├── EventGrid/                       # CMK key-expiry alerting (Event Grid + Azure Monitor)
 │   ├── KeyVault/                        # Secrets management
+│   │   └── CMK/                         # CMK Key Vault, RSA key, rotation policy & private endpoint
 │   ├── PrivateEndpoint/                 # Private endpoints
 │   └── ResourceGroup/                   # Subscription-level resource group deployment
 │
@@ -49,10 +51,12 @@ confidentialavd/
 │   ├── AVD-GalleryInfrastructure.yml    # Deploy gallery + definitions
 │   ├── AVD-ImageBuild.yml               # Build CC image via AIB
 │   ├── AVD-DeployAdditionalHosts.yml    # Deploy CC session hosts
+│   ├── AVD-DeployCMK.yml               # Deploy CMK Key Vault, DES & expiry alerts
 │   └── AVD-DeployIMAGER.yml             # Deploy imager VM
 │
 └── Scripts/
     ├── CreateHSM_CMK.ps1                # Create Managed HSM key for CVM encryption
+    ├── Rotate-CMK.ps1                   # Safely rotate CMK key (drain → deallocate → rotate → restart)
     ├── Get-AIBPackerLog.ps1             # Retrieve AIB Packer build logs
     ├── Register-CCFeatureFlags.ps1      # Register CC feature flags
     ├── PAWImageprep.ps1                 # Pre-sysprep remediation
@@ -83,7 +87,20 @@ Deploy the AIB Image Template and trigger the build:
 
 Use pipeline: **AVD-ImageBuild.yml** with `imageProfile: cc` and `imageType: cvm`
 
-### Step 3 - Deploy Confidential Session Hosts
+### Step 3 - Deploy CMK Infrastructure (CMK only)
+
+Deploy the Key Vault with CMK key, Disk Encryption Set, and key-expiry alerting:
+
+Use pipeline: **AVD-DeployCMK.yml** — this pipeline has four stages:
+
+1. **Approval Gate** – manual sign-off before any change
+2. **Deploy CMK Key Vault** – Premium SKU vault, RSA key with rotation policy, private endpoint, UAMI
+3. **Deploy Disk Encryption Set** – `ConfidentialVmEncryptedWithCustomerKey` linked to the Key Vault key
+4. **Deploy Key Expiry Alerts** *(optional)* – Event Grid system topic + Azure Monitor alert for `KeyNearExpiry`
+
+> **Skip this step entirely if you use PMK** (Platform-Managed Keys).
+
+### Step 4 - Deploy Confidential Session Hosts
 
 Deploy CC session hosts using the gallery image:
 
@@ -101,9 +118,12 @@ Use pipeline: **AVD-DeployAdditionalHosts.yml** with:
 - **CC VM Size**: DC-series or EC-series VMs (e.g., `Standard_DC4as_v5`, `Standard_EC8as_v6`)
 
 ### For CMK only (skip these for PMK)
-- **Managed HSM**: Key must exist for Disk Encryption Set (`ConfidentialVmEncryptedWithCustomerKey`)
-- **UAMI for DES**: Must have `Crypto Service Encryption User` role on the Managed HSM key
-- **`managedHsmKeyUrl`**: Full versioned key URL in the host pool JSON config
+- **Managed HSM _or_ Key Vault (Premium)**: Key must exist for Disk Encryption Set (`ConfidentialVmEncryptedWithCustomerKey`)
+  - **Managed HSM variant**: Use `CreateHSM_CMK.ps1` and `DiskEncryptionSet/main.bicep`
+  - **Key Vault variant**: Use pipeline `AVD-DeployCMK.yml` which deploys `KeyVault/CMK/main.bicep` + `DiskEncryptionSet/cmk-kv.bicep`
+- **UAMI for DES**: Must have `Crypto Service Encryption User` role on the key
+- **Key Rotation**: CVM does **not** support automatic rotation. Use `Scripts/Rotate-CMK.ps1` to safely drain, deallocate, rotate, and restart session hosts
+- **Key Expiry Alerting** *(optional)*: `EventGrid/cmk-key-expiry-alert.bicep` deploys Event Grid + Azure Monitor alerts that fire 30 days before the CMK key expires
 
 ## 📚 References
 

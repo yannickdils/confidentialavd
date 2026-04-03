@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "keyVaultName": {
+      "value": "kv-avd-cmk-prd-weu-001"
+    },
+    "diskEncryptionSetIdentityName": {
+      "value": "uami-des-avd-prd-weu-001"
+    },
+    "keyName": {
+      "value": "cmk-avd-prd-weu-001"
+    },
+    "keySize": {
+      "value": 3072
+    },
+    "keyRotationPeriod": {
+      "value": "P1Y"
+    },
+    "keyExpiryNotificationDays": {
+      "value": 30
+    },
+    "pepSubnetId": {
+      "value": "/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RG>/providers/Microsoft.Network/virtualNetworks/<VNET>/subnets/<SUBNET>"
+    },
+    "privateDnsZoneId": {
+      "value": "/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RG>/providers/Microsoft.Network/privateDnsZones/privatelink.vaultcore.azure.net"
+    },
+    "logAnalyticsWorkspaceId": {
+      "value": ""
+    },
+    "tags": {
+      "value": {
+        "environment": "prd",
+        "component": "cmk",
+        "purpose": "confidential-vm-disk-encryption",
+        "owner": ""
+      }
+    }
+  }
+}

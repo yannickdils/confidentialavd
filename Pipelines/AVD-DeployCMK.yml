@@ -1,0 +1,246 @@
+trigger:
+- none
+
+pool:
+  name: ${{ parameters.agentPool }}
+
+parameters:
+  - name: agentPool
+    type: string
+    default: '<AGENT_POOL_NAME>'
+    displayName: "Agent pool name"
+
+  - name: serviceConnection
+    type: string
+    default: '<SERVICE_CONNECTION_NAME>'
+    displayName: "Azure DevOps service connection name"
+
+  - name: approvalEnvironment
+    type: string
+    default: '<APPROVAL_ENVIRONMENT_NAME>'
+    displayName: "Azure DevOps approval environment name"
+
+  - name: subscriptionName
+    type: string
+    displayName: "Azure subscription name or ID"
+    default: '<SUBSCRIPTION_NAME>'
+
+  - name: resourceGroup
+    type: string
+    displayName: "Resource group for Key Vault and alert resources"
+    default: 'rg-avd-cmk-prd-weu-001'
+
+  - name: location
+    type: string
+    displayName: "Azure region"
+    default: 'westeurope'
+
+  - name: deployAlerts
+    type: boolean
+    displayName: "Deploy Event Grid and Azure Monitor alert infrastructure"
+    default: true
+
+  - name: deploymentIdentifier
+    type: string
+    default: "deployment"
+    displayName: "Unique deployment identifier (used to namespace pipeline stages)"
+
+stages:
+  # ---------------------------------------------------------------------------
+  # Approval gate - requires a human sign-off before any changes are made.
+  # CMK infrastructure changes can affect all session hosts in the host pool,
+  # so an approval gate is mandatory.
+  # ---------------------------------------------------------------------------
+  - stage: approvalGate_${{ parameters.deploymentIdentifier }}
+    displayName: "Approval Gate"
+    jobs:
+      - deployment: cmkDeployment
+        displayName: "Approval Gate for CMK Deployment"
+        environment: ${{ parameters.approvalEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+  # ---------------------------------------------------------------------------
+  # Deploy Key Vault with CMK key and rotation policy
+  # ---------------------------------------------------------------------------
+  - stage: DeployKeyVault_${{ parameters.deploymentIdentifier }}
+    displayName: "Deploy CMK Key Vault"
+    dependsOn: approvalGate_${{ parameters.deploymentIdentifier }}
+    condition: succeeded('approvalGate_${{ parameters.deploymentIdentifier }}')
+    jobs:
+      - job: DeployKV
+        displayName: "Deploy Key Vault and CMK Key"
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Ensure Resource Group Exists"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az account set --subscription "${{ parameters.subscriptionName }}"
+                $rg = az group show --name "${{ parameters.resourceGroup }}" --query "name" -o tsv 2>$null
+                if (-not $rg) {
+                  Write-Host "Creating resource group ${{ parameters.resourceGroup }}"
+                  az group create `
+                    --name "${{ parameters.resourceGroup }}" `
+                    --location "${{ parameters.location }}"
+                } else {
+                  Write-Host "Resource group ${{ parameters.resourceGroup }} already exists."
+                }
+
+          - task: AzureCLI@2
+            displayName: "What-If: CMK Key Vault Deployment"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az account set --subscription "${{ parameters.subscriptionName }}"
+                az deployment group what-if `
+                  --resource-group "${{ parameters.resourceGroup }}" `
+                  --name "CMK-KV-WhatIf-$(Build.BuildId)" `
+                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/KeyVault/CMK/main.bicep" `
+                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/KeyVault/CMK/main.parameters.json" `
+                  --no-prompt true
+
+          - task: AzureCLI@2
+            displayName: "Deploy CMK Key Vault"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az account set --subscription "${{ parameters.subscriptionName }}"
+
+                $output = az deployment group create `
+                  --resource-group "${{ parameters.resourceGroup }}" `
+                  --name "CMK-KV-$(Build.BuildId)" `
+                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/KeyVault/CMK/main.bicep" `
+                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/KeyVault/CMK/main.parameters.json" `
+                  --mode Incremental `
+                  --no-prompt true `
+                  -o json
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]CMK Key Vault deployment failed."
+                  exit 1
+                }
+
+                $outputs = ($output | ConvertFrom-Json).properties.outputs
+                $keyVaultId   = $outputs.keyVaultId.value
+                $keyVersionlessUri = $outputs.cmkKeyVersionlessUri.value
+                $desIdentityId = $outputs.desIdentityId.value
+
+                Write-Host "Key Vault ID          : $keyVaultId"
+                Write-Host "CMK Versionless URI   : $keyVersionlessUri"
+                Write-Host "DES Identity ID       : $desIdentityId"
+
+                # Publish as pipeline variables for downstream stages
+                Write-Host "##vso[task.setvariable variable=keyVaultId;isOutput=true]$keyVaultId"
+                Write-Host "##vso[task.setvariable variable=cmkKeyVersionlessUri;isOutput=true]$keyVersionlessUri"
+                Write-Host "##vso[task.setvariable variable=desIdentityId;isOutput=true]$desIdentityId"
+
+                Write-Host "##[section]CMK Key Vault deployment complete."
+            name: kvDeploy
+
+  # ---------------------------------------------------------------------------
+  # Deploy Disk Encryption Set referencing the Key Vault CMK
+  # ---------------------------------------------------------------------------
+  - stage: DeployDES_${{ parameters.deploymentIdentifier }}
+    displayName: "Deploy Disk Encryption Set"
+    dependsOn: DeployKeyVault_${{ parameters.deploymentIdentifier }}
+    condition: succeeded('DeployKeyVault_${{ parameters.deploymentIdentifier }}')
+    variables:
+      desIdentityId: $[ stageDependencies.DeployKeyVault_${{ parameters.deploymentIdentifier }}.DeployKV.outputs['kvDeploy.desIdentityId'] ]
+      cmkKeyVersionlessUri: $[ stageDependencies.DeployKeyVault_${{ parameters.deploymentIdentifier }}.DeployKV.outputs['kvDeploy.cmkKeyVersionlessUri'] ]
+    jobs:
+      - job: DeployDES
+        displayName: "Deploy DES (ConfidentialVmEncryptedWithCustomerKey)"
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Deploy Disk Encryption Set"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az account set --subscription "${{ parameters.subscriptionName }}"
+
+                $desIdentityId       = "$(desIdentityId)"
+                $cmkKeyVersionlessUri = "$(cmkKeyVersionlessUri)"
+
+                Write-Host "DES Identity ID       : $desIdentityId"
+                Write-Host "CMK Versionless URI   : $cmkKeyVersionlessUri"
+
+                $output = az deployment group create `
+                  --resource-group "${{ parameters.resourceGroup }}" `
+                  --name "CMK-DES-$(Build.BuildId)" `
+                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/DiskEncryptionSet/cmk-kv.bicep" `
+                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/DiskEncryptionSet/main.parameters.json" `
+                  --parameters userAssignedIdentityId="$desIdentityId" `
+                  --parameters keyVaultKeyUri="$cmkKeyVersionlessUri" `
+                  --mode Incremental `
+                  --no-prompt true `
+                  -o json
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]DES deployment failed."
+                  exit 1
+                }
+
+                $desId = ($output | ConvertFrom-Json).properties.outputs.diskEncryptionSetId.value
+                Write-Host "Disk Encryption Set ID: $desId"
+                Write-Host "##vso[task.setvariable variable=diskEncryptionSetId;isOutput=true]$desId"
+                Write-Host "##[section]DES deployment complete."
+            name: desDeploy
+
+  # ---------------------------------------------------------------------------
+  # Deploy Event Grid + Azure Monitor alert infrastructure (optional)
+  # ---------------------------------------------------------------------------
+  - stage: DeployAlerts_${{ parameters.deploymentIdentifier }}
+    displayName: "Deploy CMK Key Expiry Alerts"
+    dependsOn: DeployKeyVault_${{ parameters.deploymentIdentifier }}
+    condition: and(succeeded('DeployKeyVault_${{ parameters.deploymentIdentifier }}'), eq('${{ parameters.deployAlerts }}', 'true'))
+    variables:
+      keyVaultId: $[ stageDependencies.DeployKeyVault_${{ parameters.deploymentIdentifier }}.DeployKV.outputs['kvDeploy.keyVaultId'] ]
+    jobs:
+      - job: DeployAlerts
+        displayName: "Deploy Event Grid and Azure Monitor Alerts"
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Deploy Key Expiry Alert Infrastructure"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az account set --subscription "${{ parameters.subscriptionName }}"
+
+                $keyVaultId = "$(keyVaultId)"
+                Write-Host "Key Vault ID: $keyVaultId"
+
+                az deployment group create `
+                  --resource-group "${{ parameters.resourceGroup }}" `
+                  --name "CMK-Alerts-$(Build.BuildId)" `
+                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/EventGrid/cmk-key-expiry-alert.bicep" `
+                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/EventGrid/cmk-key-expiry-alert.parameters.json" `
+                  --parameters keyVaultId="$keyVaultId" `
+                  --mode Incremental `
+                  --no-prompt true
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Alert infrastructure deployment failed."
+                  exit 1
+                }
+
+                Write-Host "##[section]CMK alert infrastructure deployment complete."

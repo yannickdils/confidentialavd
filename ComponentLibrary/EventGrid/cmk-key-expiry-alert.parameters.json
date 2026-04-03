@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "keyVaultName": {
+      "value": "kv-avd-cmk-prd-weu-001"
+    },
+    "keyVaultId": {
+      "value": "/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RG>/providers/Microsoft.KeyVault/vaults/kv-avd-cmk-prd-weu-001"
+    },
+    "actionGroupName": {
+      "value": "ag-cmk-avd-expiry-prd"
+    },
+    "actionGroupShortName": {
+      "value": "CMKExpiry"
+    },
+    "notificationEmails": {
+      "value": [
+        "avd-ops@yourorg.com",
+        "security@yourorg.com"
+      ]
+    },
+    "webhookUri": {
+      "value": ""
+    },
+    "tags": {
+      "value": {
+        "environment": "prd",
+        "component": "cmk-monitoring",
+        "purpose": "key-expiry-alerting",
+        "owner": ""
+      }
+    }
+  }
+}
