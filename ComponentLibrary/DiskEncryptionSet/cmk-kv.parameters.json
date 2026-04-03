@@ -1,0 +1,34 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "diskEncryptionSetName": {
+            "value": ""
+        },
+        "userAssignedIdentityId": {
+            "value": ""
+        },
+        "keyVaultKeyUri": {
+            "value": ""
+        },
+        "tags": {
+            "value": {
+                "app": "",
+                "environment": "",
+                "importance": "",
+                "product": "",
+                "team": "",
+                "applicationowner": "",
+                "application": "",
+                "businessdomain": "",
+                "activeworkinghours": "",
+                "activeworkingdays": "",
+                "startstopenabled": "",
+                "owner": "",
+                "component": "",
+                "purpose": "",
+                "hostpool": ""
+            }
+        }
+    }
+}

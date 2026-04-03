@@ -114,12 +114,13 @@ resource pepDnsGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@20
 
 // ---------------------------------------------------------------------------
 // Role assignments
-// Key Vault Crypto Officer - needed by the deployment pipeline service principal
-// to CREATE the key and set rotation policy.
-// Key Vault Crypto Service Encryption User - needed by the DES identity at
-// runtime to wrap/unwrap the data encryption key.
+// Key Vault Crypto Officer must be granted to the pipeline service principal
+// BEFORE running this template so it can create the key and set the rotation
+// policy. That assignment is a one-time prerequisite, not managed here.
+//
+// Key Vault Crypto Service Encryption User is assigned below for the DES
+// identity so it can wrap/unwrap the data encryption key at runtime.
 // ---------------------------------------------------------------------------
-var cryptoOfficerRoleId = '14b46e9e-c2b7-41b4-b07b-48a6ebf60603' // Key Vault Crypto Officer
 var cryptoServiceEncryptionUserRoleId = 'e147488a-f6f5-4113-8e2d-b22465e65bf6' // Key Vault Crypto Service Encryption User
 
 resource desIdentityCryptoUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -161,10 +162,10 @@ resource cmkKey 'Microsoft.KeyVault/vaults/keys@2023-07-01' = {
       lifetimeActions: [
         {
           action: {
-            // Notify only - do NOT set type to 'Rotate' because CVM does not
+            // Notify only - do NOT set type to 'rotate' because CVM does not
             // support automatic rotation. The notification fires the Event Grid
             // event that triggers our alerting runbook.
-            type: 'Notify'
+            type: 'notify'
           }
           trigger: {
             timeBeforeExpiry: 'P${keyExpiryNotificationDays}D'

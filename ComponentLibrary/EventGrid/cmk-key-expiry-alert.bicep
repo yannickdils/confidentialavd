@@ -72,45 +72,16 @@ resource eventGridTopic 'Microsoft.EventGrid/systemTopics@2023-12-15-preview' = 
 }
 
 // ---------------------------------------------------------------------------
-// Azure Monitor Alert rule that listens to the Event Grid system topic and
-// fires the Action Group when a KeyNearExpiry event arrives.
-// Using the Event Grid - Azure Monitor Alerts integration so we do not need a
-// separate Logic App or Azure Function just to send an email.
+// Event Grid subscription that routes KeyNearExpiry / KeyExpired /
+// KeyNewVersionCreated events directly to Azure Monitor as alerts.
+// The MonitorAlert destination creates monitor alerts automatically and
+// triggers the Action Group — no standalone Activity Log Alert is needed.
 // ---------------------------------------------------------------------------
-resource nearExpiryAlert 'Microsoft.Insights/activityLogAlerts@2020-10-01' = {
-  name: 'alert-cmk-key-near-expiry-${keyVaultName}'
-  location: 'global'
-  tags: tags
-  properties: {
-    enabled: true
-    description: 'Fires 30 days before the CMK key in ${keyVaultName} expires. Take action: stop CVM session hosts, update DES key version, restart hosts.'
-    scopes: [
-      keyVaultId
-    ]
-    condition: {
-      allOf: [
-        {
-          field: 'category'
-          equals: 'ResourceHealth'
-        }
-      ]
-    }
-    actions: {
-      actionGroups: [
-        {
-          actionGroupId: actionGroup.id
-        }
-      ]
-    }
-  }
-}
-
-// Event Grid subscription that routes KeyNearExpiry events to Azure Monitor
 resource nearExpiryEventSubscription 'Microsoft.EventGrid/systemTopics/eventSubscriptions@2023-12-15-preview' = {
   name: 'sub-cmk-key-near-expiry'
   parent: eventGridTopic
   properties: {
-    eventDeliverySchema: 'CloudEventSchemaV1_0'
+    eventDeliverySchema: 'EventGridSchema'
     filter: {
       includedEventTypes: [
         'Microsoft.KeyVault.KeyNearExpiry'
@@ -119,9 +90,13 @@ resource nearExpiryEventSubscription 'Microsoft.EventGrid/systemTopics/eventSubs
       ]
     }
     destination: {
-      endpointType: 'AzureMonitorAlert'
+      endpointType: 'MonitorAlert'
       properties: {
-        resourceId: nearExpiryAlert.id
+        actionGroups: [
+          actionGroup.id
+        ]
+        description: 'CMK key event detected for Key Vault ${keyVaultName}. If nearing expiry: stop CVM session hosts, rotate the key (update DES key version), then restart hosts.'
+        severity: 'Sev1'
       }
     }
     retryPolicy: {
