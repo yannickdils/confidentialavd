@@ -15,7 +15,7 @@ Bicep module that deploys a **Premium Key Vault** purpose-built for Customer-Man
 
 ## ⚠️ CVM Key Rotation Caveat
 
-Confidential VMs do **not** support automatic key rotation. The rotation policy on the key is configured to **notify only** — it fires `Microsoft.KeyVault.KeyNearExpiry` events so you can alert on them (see [`EventGrid/cmk-key-expiry-alert.bicep`](../../EventGrid/cmk-key-expiry-alert.bicep)).
+Confidential VMs do **not** support automatic key rotation. The rotation policy on the key is configured to **notify only** - it fires `Microsoft.KeyVault.KeyNearExpiry` events so you can alert on them (see [`EventGrid/cmk-key-expiry-alert.bicep`](../../EventGrid/cmk-key-expiry-alert.bicep)).
 
 Actual rotation requires all session hosts using the DES to be **stopped / deallocated** before updating the key version. Use [`Scripts/Rotate-CMK.ps1`](../../../Scripts/Rotate-CMK.ps1) for the full drain → deallocate → rotate → restart sequence.
 
@@ -23,17 +23,17 @@ Actual rotation requires all session hosts using the DES to be **stopped / deall
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `keyVaultName` | `string` | — | Name of the Key Vault |
+| `keyVaultName` | `string` | - | Name of the Key Vault |
 | `location` | `string` | `resourceGroup().location` | Azure region |
-| `diskEncryptionSetIdentityName` | `string` | — | Name of the UAMI for the DES |
-| `keyName` | `string` | — | Name of the CMK key |
+| `diskEncryptionSetIdentityName` | `string` | - | Name of the UAMI for the DES |
+| `keyName` | `string` | - | Name of the CMK key |
 | `keySize` | `int` | `3072` | RSA key size (2048 / 3072 / 4096) |
 | `keyRotationPeriod` | `string` | `P1Y` | ISO 8601 duration for key expiry |
 | `keyExpiryNotificationDays` | `int` | `30` | Days before expiry to fire notification |
 | `logAnalyticsWorkspaceId` | `string` | `''` | Log Analytics workspace resource ID (empty = skip) |
-| `pepSubnetId` | `string` | — | Subnet resource ID for the private endpoint |
-| `privateDnsZoneId` | `string` | — | `privatelink.vaultcore.azure.net` DNS zone resource ID |
-| `tags` | `object` | — | Tags applied to all resources |
+| `pepSubnetId` | `string` | - | Subnet resource ID for the private endpoint |
+| `privateDnsZoneId` | `string` | - | `privatelink.vaultcore.azure.net` DNS zone resource ID |
+| `tags` | `object` | - | Tags applied to all resources |
 
 ## Outputs
 
@@ -44,7 +44,7 @@ Actual rotation requires all session hosts using the DES to be **stopped / deall
 | `keyVaultUri` | Vault URI (e.g. `https://<name>.vault.azure.net/`) |
 | `cmkKeyId` | Resource ID of the RSA key |
 | `cmkKeyName` | Name of the RSA key |
-| `cmkKeyVersionlessUri` | Versionless key URI — use this as `activeKey.keyUrl` on the DES |
+| `cmkKeyVersionlessUri` | Versionless key URI - use this as `activeKey.keyUrl` on the DES |
 | `desIdentityId` | Resource ID of the UAMI for the DES |
 | `desIdentityPrincipalId` | Object (principal) ID of the UAMI |
 

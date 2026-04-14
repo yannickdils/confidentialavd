@@ -75,7 +75,7 @@ resource eventGridTopic 'Microsoft.EventGrid/systemTopics@2023-12-15-preview' = 
 // Event Grid subscription that routes KeyNearExpiry / KeyExpired /
 // KeyNewVersionCreated events directly to Azure Monitor as alerts.
 // The MonitorAlert destination creates monitor alerts automatically and
-// triggers the Action Group — no standalone Activity Log Alert is needed.
+// triggers the Action Group - no standalone Activity Log Alert is needed.
 // ---------------------------------------------------------------------------
 resource nearExpiryEventSubscription 'Microsoft.EventGrid/systemTopics/eventSubscriptions@2023-12-15-preview' = {
   name: 'sub-cmk-key-near-expiry'

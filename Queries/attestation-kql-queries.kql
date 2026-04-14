@@ -1,0 +1,204 @@
+// =============================================================================
+// Confidential AVD - Guest Attestation Log Analytics Queries
+// =============================================================================
+// Save these queries to your Log Analytics workspace as Saved Searches or
+// paste them into the AVD Insights workbook as custom tiles.
+//
+// All queries assume:
+//   - The GuestAttestation extension is installed on all CVM session hosts
+//   - The DCR from dcr-confidential-avd.bicep is associated to all session hosts
+//   - The AzureMonitorWindowsAgent extension is collecting data
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// QUERY 1: Attestation extension health per session host (last 24 hours)
+//
+// Shows the current provisioning state of the GuestAttestation extension on
+// every CVM session host. A host that is NOT in this table has never sent
+// attestation telemetry - investigate immediately.
+// -----------------------------------------------------------------------------
+WindowsEvent
+| where TimeGenerated > ago(24h)
+| where Channel contains "Attestation"
+| summarize
+    LastSeen    = max(TimeGenerated),
+    EventCount  = count(),
+    ErrorCount  = countif(Level in (1, 2)),
+    WarnCount   = countif(Level == 3)
+    by Computer
+| extend AttestationHealth = case(
+    ErrorCount > 0, "ERROR",
+    WarnCount  > 0, "WARNING",
+    "HEALTHY"
+  )
+| project
+    SessionHost     = Computer,
+    AttestationHealth,
+    LastSeen,
+    EventCount,
+    ErrorCount,
+    WarnCount
+| order by AttestationHealth asc, LastSeen desc
+
+
+// -----------------------------------------------------------------------------
+// QUERY 2: Attestation failures and warnings (last 7 days)
+//
+// Shows all Level 1 (Critical), Level 2 (Error), and Level 3 (Warning) events
+// from the attestation and TPM channels. Use this to investigate hosts that
+// appear unhealthy in Query 1.
+// -----------------------------------------------------------------------------
+WindowsEvent
+| where TimeGenerated > ago(7d)
+| where Channel in ("Microsoft-Windows-Attestation/Operational",
+                    "Microsoft-Windows-TPM-WMI/Operational",
+                    "Microsoft-Windows-Kernel-Boot/Operational")
+| where Level in (1, 2, 3)
+| extend Severity = case(Level == 1, "Critical", Level == 2, "Error", "Warning")
+| project
+    TimeGenerated,
+    SessionHost = Computer,
+    Severity,
+    Channel,
+    EventID,
+    Message = tostring(EventData)
+| order by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+// QUERY 3: vTPM key operation events (last 7 days)
+//
+// Security event IDs 5059 and 5061 indicate key migration operations on the
+// vTPM. These should only appear during image deployments, CMK key rotations,
+// or explicit key operations. Unexpected events warrant investigation.
+// -----------------------------------------------------------------------------
+SecurityEvent
+| where TimeGenerated > ago(7d)
+| where EventID in (5059, 5061, 5379, 5380)
+| extend EventMeaning = case(
+    EventID == 5059, "Key migration operation",
+    EventID == 5061, "Cryptographic operation",
+    EventID == 5379, "Credential Manager credential read",
+    EventID == 5380, "Credential Manager credentials enumerated",
+    "Other"
+  )
+| project
+    TimeGenerated,
+    SessionHost = Computer,
+    EventID,
+    EventMeaning,
+    Account,
+    Activity
+| order by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+// QUERY 4: Session hosts that have NEVER sent attestation events
+//
+// Cross-references the list of computers sending Windows events with the list
+// sending attestation events. Hosts that appear in the left set but NOT the
+// right set are missing attestation telemetry.
+//
+// This requires at least 24 hours of data after deploying the DCR.
+// -----------------------------------------------------------------------------
+let AllHosts = WindowsEvent
+    | where TimeGenerated > ago(24h)
+    | summarize by Computer;
+let AttestingHosts = WindowsEvent
+    | where TimeGenerated > ago(24h)
+    | where Channel contains "Attestation"
+    | summarize by Computer;
+AllHosts
+| join kind=leftanti AttestingHosts on Computer
+| project
+    SessionHost             = Computer,
+    Status                  = "NO ATTESTATION EVENTS",
+    Action                  = "Check GuestAttestation extension - may be missing or failing silently"
+
+
+// -----------------------------------------------------------------------------
+// QUERY 5: Attestation event trend (last 30 days, daily)
+//
+// Useful as a time-chart in the AVD Insights workbook. Shows daily counts of
+// attestation events split by severity. A sudden spike in errors often
+// correlates with a deployment, CMK rotation, or infrastructure change.
+// -----------------------------------------------------------------------------
+WindowsEvent
+| where TimeGenerated > ago(30d)
+| where Channel contains "Attestation" or Channel contains "TPM"
+| extend Severity = case(Level == 1, "Critical", Level == 2, "Error", Level == 3, "Warning", "Info")
+| summarize Count = count() by bin(TimeGenerated, 1d), Severity
+| order by TimeGenerated asc
+
+
+// -----------------------------------------------------------------------------
+// QUERY 6: Security events - logon activity per session host (last 7 days)
+//
+// Shows user logon/logoff counts per session host. Useful for correlating
+// attestation failures with active user sessions (a failed attestation on a
+// busy host is more urgent than one on an idle host).
+// -----------------------------------------------------------------------------
+SecurityEvent
+| where TimeGenerated > ago(7d)
+| where EventID in (4624, 4634, 4647)
+| extend EventType = case(EventID == 4624, "Logon", "Logoff")
+| summarize
+    Logons  = countif(EventID == 4624),
+    Logoffs = countif(EventID in (4634, 4647))
+    by SessionHost = Computer
+| project SessionHost, Logons, Logoffs, ActiveSessions = Logons - Logoffs
+| order by ActiveSessions desc
+
+
+// -----------------------------------------------------------------------------
+// QUERY 7: Performance baseline - CVM session host health (last 1 hour)
+//
+// Quick health check for all CVM session hosts: CPU, memory, disk, and
+// active session counts. Use this as a starting point for an AVD Insights
+// custom tab.
+// -----------------------------------------------------------------------------
+Perf
+| where TimeGenerated > ago(1h)
+| where ObjectName in ("Processor", "Memory", "LogicalDisk", "Terminal Services")
+| where CounterName in (
+    "% Processor Time",
+    "Available MBytes",
+    "% Free Space",
+    "Active Sessions",
+    "Total Sessions"
+  )
+| where InstanceName in ("_Total", "C:", "")
+| summarize Value = avg(CounterValue) by Computer, CounterName
+| evaluate pivot(CounterName, avg(Value))
+| project
+    SessionHost          = Computer,
+    CPU_Pct              = round(['% Processor Time'], 1),
+    AvailMemMB           = round(['Available MBytes'], 0),
+    DiskFree_Pct         = round(['% Free Space'], 1),
+    ActiveSessions       = toint(['Active Sessions']),
+    TotalSessions        = toint(['Total Sessions'])
+| order by ActiveSessions desc
+
+
+// -----------------------------------------------------------------------------
+// QUERY 8: Azure Policy compliance - Guest Attestation extension
+//
+// This query surfaces Azure Policy non-compliance events for the
+// require-guest-attestation policy. Requires Azure Policy logs to be routed
+// to the same Log Analytics Workspace via a diagnostic setting on the
+// subscription.
+// -----------------------------------------------------------------------------
+AzureActivity
+| where TimeGenerated > ago(7d)
+| where OperationNameValue contains "policyAssignments"
+    or OperationNameValue contains "policyDefinitions"
+    or CategoryValue == "Policy"
+| where ActivityStatusValue == "Failure" or ResultType == "Failed"
+| project
+    TimeGenerated,
+    OperationName   = OperationNameValue,
+    ResourceGroup,
+    Resource        = ResourceId,
+    Description     = Properties
+| order by TimeGenerated desc

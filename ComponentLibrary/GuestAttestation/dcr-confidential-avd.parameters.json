@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "dataCollectionRuleName": {
+      "value": "dcr-avd-confidential-prd-weu-001"
+    },
+    "logAnalyticsWorkspaceId": {
+      "value": "/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<LOG_ANALYTICS_RESOURCE_GROUP>/providers/Microsoft.OperationalInsights/workspaces/<LOG_ANALYTICS_WORKSPACE_NAME>"
+    },
+    "tags": {
+      "value": {
+        "environment": "prd",
+        "component": "monitoring",
+        "purpose": "confidential-avd-attestation-monitoring",
+        "owner": ""
+      }
+    }
+  }
+}
