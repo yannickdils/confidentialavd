@@ -184,7 +184,7 @@ stages:
                   --resource-group "${{ parameters.resourceGroup }}" `
                   --name "CMK-DES-$(Build.BuildId)" `
                   --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/DiskEncryptionSet/cmk-kv.bicep" `
-                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/DiskEncryptionSet/main.parameters.json" `
+                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/DiskEncryptionSet/cmk-kv.parameters.json" `
                   --parameters userAssignedIdentityId="$desIdentityId" `
                   --parameters keyVaultKeyUri="$cmkKeyVersionlessUri" `
                   --mode Incremental `

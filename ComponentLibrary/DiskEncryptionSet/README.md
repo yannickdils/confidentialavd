@@ -75,6 +75,7 @@ az deployment group create \
 | File | Purpose |
 |------|---------|
 | [`main.parameters.json`](main.parameters.json) | Example parameters for the HSM variant |
+| [`cmk-kv.parameters.json`](cmk-kv.parameters.json) | Example parameters for the Key Vault variant |
 | [`KeyVault/CMK/main.bicep`](../KeyVault/CMK/main.bicep) | CMK Key Vault module that outputs `cmkKeyVersionlessUri` and `desIdentityId` |
 | [`Pipelines/AVD-DeployCMK.yml`](../../Pipelines/AVD-DeployCMK.yml) | Pipeline that chains KV → DES → Alerts |
 
