@@ -1,4 +1,4 @@
-# EventGrid — CMK Key Expiry Alerting
+# EventGrid - CMK Key Expiry Alerting
 
 Bicep module that deploys **Event Grid + Azure Monitor** infrastructure to alert when a CMK key stored in Key Vault is approaching expiry.
 
@@ -11,7 +11,7 @@ Confidential VMs do **not** support automatic key rotation. If the CMK key expir
 | Resource | Description |
 |----------|-------------|
 | **Action Group** | Email receivers (+ optional webhook) for key-expiry notifications |
-| **Event Grid System Topic** | Scoped to the Key Vault — captures `KeyNearExpiry`, `KeyExpired`, `KeyNewVersionCreated` |
+| **Event Grid System Topic** | Scoped to the Key Vault - captures `KeyNearExpiry`, `KeyExpired`, `KeyNewVersionCreated` |
 | **Activity Log Alert** | Azure Monitor alert that fires the Action Group when a near-expiry event arrives |
 | **Event Grid Subscription** | Routes the Key Vault events to the Azure Monitor alert (CloudEvents v1.0 schema) |
 
@@ -19,15 +19,15 @@ Confidential VMs do **not** support automatic key rotation. If the CMK key expir
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `keyVaultName` | `string` | — | Name of the Key Vault to monitor |
-| `keyVaultId` | `string` | — | Resource ID of the Key Vault |
+| `keyVaultName` | `string` | - | Name of the Key Vault to monitor |
+| `keyVaultId` | `string` | - | Resource ID of the Key Vault |
 | `location` | `string` | `resourceGroup().location` | Azure region |
-| `actionGroupName` | `string` | — | Action Group name |
-| `actionGroupShortName` | `string` | — | Action Group display short name |
-| `notificationEmails` | `array` | — | Email addresses to notify |
+| `actionGroupName` | `string` | - | Action Group name |
+| `actionGroupShortName` | `string` | - | Action Group display short name |
+| `notificationEmails` | `array` | - | Email addresses to notify |
 | `webhookUri` | `string` | `''` | Optional webhook URI (e.g. Logic App / Power Automate) |
 | `eventGridTopicName` | `string` | `evgt-<kvName>-cmk` | Event Grid System Topic name |
-| `tags` | `object` | — | Tags applied to all resources |
+| `tags` | `object` | - | Tags applied to all resources |
 
 ## Outputs
 

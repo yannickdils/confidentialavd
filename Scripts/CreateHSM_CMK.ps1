@@ -229,7 +229,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ""
 
 # ---------------------------------------------------------------------------
-# Check if the key already exists — this script only creates new keys
+# Check if the key already exists - this script only creates new keys
 # ---------------------------------------------------------------------------
 Write-Host "[4/7] Checking if key '$KeyName' already exists in HSM '$HsmName'..." -ForegroundColor Yellow
 

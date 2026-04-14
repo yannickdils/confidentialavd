@@ -36,8 +36,10 @@ confidentialavd/
 │   │   └── ManagedIdentity/             # User-Assigned Identity
 │   ├── DiskEncryptionSet/               # CC disk encryption (Managed HSM + Key Vault variants)
 │   ├── EventGrid/                       # CMK key-expiry alerting (Event Grid + Azure Monitor)
+│   ├── GuestAttestation/                # Attestation Provider + CVM Data Collection Rule
 │   ├── KeyVault/                        # Secrets management
 │   │   └── CMK/                         # CMK Key Vault, RSA key, rotation policy & private endpoint
+│   ├── Policy/                          # Azure Policy for Guest Attestation compliance
 │   ├── PrivateEndpoint/                 # Private endpoints
 │   └── ResourceGroup/                   # Subscription-level resource group deployment
 │
@@ -52,11 +54,16 @@ confidentialavd/
 │   ├── AVD-ImageBuild.yml               # Build CC image via AIB
 │   ├── AVD-DeployAdditionalHosts.yml    # Deploy CC session hosts
 │   ├── AVD-DeployCMK.yml               # Deploy CMK Key Vault, DES & expiry alerts
-│   └── AVD-DeployIMAGER.yml             # Deploy imager VM
+│   ├── AVD-DeployIMAGER.yml             # Deploy imager VM
+│   └── AVD-DeployAttestation.yml        # Deploy attestation infrastructure + policy
+│
+├── Queries/
+│   └── attestation-kql-queries.kql      # KQL queries for attestation monitoring
 │
 └── Scripts/
     ├── CreateHSM_CMK.ps1                # Create Managed HSM key for CVM encryption
-    ├── Rotate-CMK.ps1                   # Safely rotate CMK key (drain → deallocate → rotate → restart)
+    ├── Rotate-CMK.ps1                   # Safely rotate CMK key (drain, deallocate, rotate, restart)
+    ├── Get-AttestationStatus.ps1        # Check GuestAttestation extension health on all CVMs
     ├── Get-AIBPackerLog.ps1             # Retrieve AIB Packer build logs
     ├── Register-CCFeatureFlags.ps1      # Register CC feature flags
     ├── PAWImageprep.ps1                 # Pre-sysprep remediation
@@ -91,7 +98,7 @@ Use pipeline: **AVD-ImageBuild.yml** with `imageProfile: cc` and `imageType: cvm
 
 Deploy the Key Vault with CMK key, Disk Encryption Set, and key-expiry alerting:
 
-Use pipeline: **AVD-DeployCMK.yml** — this pipeline has four stages:
+Use pipeline: **AVD-DeployCMK.yml** - this pipeline has four stages:
 
 1. **Approval Gate** – manual sign-off before any change
 2. **Deploy CMK Key Vault** – Premium SKU vault, RSA key with rotation policy, private endpoint, UAMI
@@ -127,7 +134,7 @@ Use pipeline: **AVD-DeployAdditionalHosts.yml** with:
 
 ## 📚 References
 
-- [📝 Blog: How to build and deploy confidential AVD images with Azure Image Builder](https://www.tunecom.be/how-to-build-confidential-avd-images-with-azure-image-builder/) — Full walkthrough, architecture decisions, and gotchas
+- [📝 Blog: How to build and deploy confidential AVD images with Azure Image Builder](https://www.tunecom.be/how-to-build-confidential-avd-images-with-azure-image-builder/) - Full walkthrough, architecture decisions, and gotchas
 - [Azure Confidential VMs](https://learn.microsoft.com/en-us/azure/confidential-computing/confidential-vm-overview)
 - [Azure Image Builder](https://learn.microsoft.com/en-us/azure/virtual-machines/image-builder-overview)
 - [Disk Encryption with Confidential VMs](https://learn.microsoft.com/en-us/azure/confidential-computing/confidential-vm-disk-encryption)

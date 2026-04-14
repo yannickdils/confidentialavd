@@ -4,14 +4,14 @@ Bicep modules for creating a **Disk Encryption Set** with `ConfidentialVmEncrypt
 
 ## Module Variants
 
-This folder contains **two** Bicep templates — choose the one that matches your key store:
+This folder contains **two** Bicep templates - choose the one that matches your key store:
 
 | File | Key Store | When to Use |
 |------|-----------|-------------|
 | [`main.bicep`](main.bicep) | **Managed HSM** | You already have a Managed HSM with an RSA-HSM key created via `Scripts/CreateHSM_CMK.ps1` |
 | [`cmk-kv.bicep`](cmk-kv.bicep) | **Key Vault (Premium)** | You deploy the Key Vault via `KeyVault/CMK/main.bicep` (used by `AVD-DeployCMK.yml` pipeline) |
 
-Both modules produce the same DES configuration — the only difference is the key source.
+Both modules produce the same DES configuration - the only difference is the key source.
 
 ## Parameters
 
@@ -48,7 +48,7 @@ Both variants export the same outputs:
 
 | Aspect | `main.bicep` (HSM) | `cmk-kv.bicep` (KV) |
 |--------|--------------------|-----------------------|
-| Key URL | **Versioned** — pinned to a specific key version | **Versionless** — DES auto-resolves to latest version |
+| Key URL | **Versioned** - pinned to a specific key version | **Versionless** - DES auto-resolves to latest version |
 | `rotationToLatestKeyVersionEnabled` | `false` | `false` |
 | Key creation | Manual via `CreateHSM_CMK.ps1` | Automated by `KeyVault/CMK/main.bicep` |
 | Pipeline | Standalone `az deployment` | `AVD-DeployCMK.yml` (stage 3) |
