@@ -36,7 +36,7 @@ confidentialavd/
 │   │   └── ManagedIdentity/             # User-Assigned Identity
 │   ├── DiskEncryptionSet/               # CC disk encryption (Managed HSM + Key Vault variants)
 │   ├── EventGrid/                       # CMK key-expiry alerting (Event Grid + Azure Monitor)
-│   ├── GuestAttestation/                # Attestation Provider + CVM Data Collection Rule
+│   ├── GuestAttestation/                # CVM Data Collection Rule for attestation monitoring
 │   ├── KeyVault/                        # Secrets management
 │   │   └── CMK/                         # CMK Key Vault, RSA key, rotation policy & private endpoint
 │   ├── Policy/                          # Azure Policy for Guest Attestation compliance
@@ -100,10 +100,10 @@ Deploy the Key Vault with CMK key, Disk Encryption Set, and key-expiry alerting:
 
 Use pipeline: **AVD-DeployCMK.yml** - this pipeline has four stages:
 
-1. **Approval Gate** – manual sign-off before any change
-2. **Deploy CMK Key Vault** – Premium SKU vault, RSA key with rotation policy, private endpoint, UAMI
-3. **Deploy Disk Encryption Set** – `ConfidentialVmEncryptedWithCustomerKey` linked to the Key Vault key
-4. **Deploy Key Expiry Alerts** *(optional)* – Event Grid system topic + Azure Monitor alert for `KeyNearExpiry`
+1. **Approval Gate** - manual sign-off before any change
+2. **Deploy CMK Key Vault** - Premium SKU vault, RSA key with rotation policy, private endpoint, UAMI
+3. **Deploy Disk Encryption Set** - `ConfidentialVmEncryptedWithCustomerKey` linked to the Key Vault key
+4. **Deploy Key Expiry Alerts** *(optional)* - Event Grid system topic + Azure Monitor alert for `KeyNearExpiry`
 
 > **Skip this step entirely if you use PMK** (Platform-Managed Keys).
 
@@ -115,6 +115,19 @@ Use pipeline: **AVD-DeployAdditionalHosts.yml** with:
 - `confidentialCompute: true`
 - `customerManagedKeys: false` for **PMK** (no DES needed)
 - `customerManagedKeys: true` for **CMK** (DES + Managed HSM required)
+
+### Step 5 - Deploy Guest Attestation Infrastructure
+
+Deploy the CVM-specific Data Collection Rule, validate GuestAttestation extension health on existing session hosts, and optionally deploy the Azure Policy definition that audits missing/failed GuestAttestation extensions. Session hosts use the Microsoft shared MAA endpoint (`https://sharedweu.weu.attest.azure.net`) automatically - no custom Attestation Provider is deployed.
+
+Use pipeline: **AVD-DeployAttestation.yml** - this pipeline has four stages:
+
+1. **Approval Gate** - human sign-off before any changes
+2. **Deploy DCR** - CVM-specific Data Collection Rule
+3. **Validate** - checks GuestAttestation extension health on all CVMs (runs `Scripts/Get-AttestationStatus.ps1`)
+4. **Policy** *(optional)* - deploys the `require-guest-attestation-confidential-avd` policy definition
+
+Run this pipeline once per environment before deploying your first CVM session hosts, or when adding attestation monitoring to an existing Confidential AVD deployment. See `ComponentLibrary/GuestAttestation/`, `ComponentLibrary/Policy/`, and `Queries/attestation-kql-queries.kql` for the underlying modules and monitoring queries.
 
 ## ⚠️ Prerequisites
 

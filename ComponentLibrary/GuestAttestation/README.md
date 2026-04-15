@@ -1,32 +1,16 @@
 # GuestAttestation
 
-Bicep modules for deploying **Guest Attestation** infrastructure for Confidential AVD session hosts. These resources provide cryptographic proof that session hosts are running inside a genuine AMD SEV-SNP or Intel TDX Trusted Execution Environment.
+Bicep modules for deploying **Guest Attestation monitoring** infrastructure for Confidential AVD session hosts. Guest Attestation itself provides cryptographic proof that session hosts are running inside a genuine AMD SEV-SNP or Intel TDX Trusted Execution Environment; the module here focuses on collecting and monitoring that attestation telemetry.
+
+> **Note:** This module does **not** deploy a custom `Microsoft.Attestation/attestationProviders` resource. That resource type is not available in Belgium Central, and it is not required for Confidential AVD - session hosts call the Microsoft shared MAA endpoint (`https://sharedweu.weu.attest.azure.net`) by default, which applies Microsoft's baseline policy validating AMD SEV-SNP, Secure Boot, and vTPM state.
 
 ## What Gets Deployed
 
 | Resource | Description |
 |----------|-------------|
-| **Attestation Provider** | Azure Attestation endpoint that CVM session hosts call to produce a signed attestation token |
 | **Data Collection Rule** | CVM-specific DCR that collects attestation events, security events, and performance counters |
 
 ## Modules
-
-### `attestation-provider.bicep`
-
-Deploys an Azure Attestation Provider scoped to a region. One provider is sufficient per region - if you already have a shared provider in your tenant, you can reference it instead.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `attestationProviderName` | `string` | - | Name of the Attestation Provider |
-| `location` | `string` | `resourceGroup().location` | Azure region |
-| `policySigningCertificateData` | `string` | `''` | Base64-encoded PEM certificate for signed policies (empty = unsigned) |
-| `tags` | `object` | - | Tags applied to all resources |
-
-| Output | Description |
-|--------|-------------|
-| `attestationProviderUri` | Attestation endpoint URI |
-| `attestationProviderId` | Resource ID of the provider |
-| `attestationProviderName` | Name of the provider |
 
 ### `dcr-confidential-avd.bicep`
 
@@ -52,18 +36,11 @@ Deploys a Data Collection Rule that collects three categories of data the standa
 
 ### Via pipeline (recommended)
 
-Use **`Pipelines/AVD-DeployAttestation.yml`** which deploys the Attestation Provider, DCR, validates extension health, and optionally deploys the Azure Policy definition.
+Use **`Pipelines/AVD-DeployAttestation.yml`** which deploys the DCR, validates GuestAttestation extension health on existing session hosts, and optionally deploys the Azure Policy definition.
 
 ### Standalone CLI deployment
 
 ```bash
-# Deploy Attestation Provider
-az deployment group create \
-  --resource-group rg-avd-attest-prd-weu-001 \
-  --template-file ComponentLibrary/GuestAttestation/attestation-provider.bicep \
-  --parameters @ComponentLibrary/GuestAttestation/attestation-provider.parameters.json
-
-# Deploy Data Collection Rule
 az deployment group create \
   --resource-group rg-avd-attest-prd-weu-001 \
   --template-file ComponentLibrary/GuestAttestation/dcr-confidential-avd.bicep \
@@ -74,7 +51,6 @@ az deployment group create \
 
 | File | Purpose |
 |------|---------|
-| [`attestation-provider.parameters.json`](attestation-provider.parameters.json) | Example parameter file for the attestation provider |
 | [`dcr-confidential-avd.parameters.json`](dcr-confidential-avd.parameters.json) | Example parameter file for the DCR |
 | [`Policy/policy-require-guest-attestation.bicep`](../Policy/policy-require-guest-attestation.bicep) | Azure Policy to audit VMs missing the GuestAttestation extension |
 | [`Scripts/Get-AttestationStatus.ps1`](../../Scripts/Get-AttestationStatus.ps1) | Script to check attestation health across all session hosts |
