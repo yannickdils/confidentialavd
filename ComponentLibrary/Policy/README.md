@@ -50,7 +50,6 @@ After deploying the definition, assign it in the Azure Portal:
 
 | File | Purpose |
 |------|---------|
-| [`GuestAttestation/attestation-provider.bicep`](../GuestAttestation/attestation-provider.bicep) | Attestation Provider that the GuestAttestation extension calls |
 | [`Scripts/Get-AttestationStatus.ps1`](../../Scripts/Get-AttestationStatus.ps1) | Script to check attestation health (complements the policy) |
 | [`Pipelines/AVD-DeployAttestation.yml`](../../Pipelines/AVD-DeployAttestation.yml) | Pipeline that deploys attestation infrastructure and this policy |
 

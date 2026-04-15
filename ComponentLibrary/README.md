@@ -9,7 +9,7 @@ This folder contains reusable Azure Bicep modules for building Confidential VM i
 | [AzureVirtualDesktop/](AzureVirtualDesktop/) | Compute Gallery, Image Definitions/Templates, CC Session Hosts, Managed Identity |
 | [DiskEncryptionSet/](DiskEncryptionSet/) | Disk Encryption Set for Confidential VM encryption - `main.bicep` (Managed HSM), `cmk-kv.bicep` (Key Vault) |
 | [EventGrid/](EventGrid/) | CMK key-expiry alerting via Event Grid system topic + Azure Monitor alerts |
-| [GuestAttestation/](GuestAttestation/) | Attestation Provider and CVM-specific Data Collection Rule for Guest Attestation |
+| [GuestAttestation/](GuestAttestation/) | CVM-specific Data Collection Rule for Guest Attestation monitoring (uses the Microsoft shared MAA endpoint) |
 | [KeyVault/](KeyVault/) | Azure Key Vault for secrets management |
 | [KeyVault/CMK/](KeyVault/CMK/) | CMK-specific Key Vault with RSA key, rotation policy, UAMI, private endpoint & diagnostics |
 | [Policy/](Policy/) | Azure Policy definitions for Guest Attestation compliance |
@@ -86,7 +86,7 @@ Typical deployment order for Confidential VM image build and session host deploy
 8. EventGrid alert       (Key expiry alerting via Event Grid + Azure Monitor) - CMK only, optional
 9. KeyVault              (Secrets for admin credentials / domain join)
 10. SessionHost (CC)     (Confidential Compute session hosts)
-11. GuestAttestation     (Attestation Provider + CVM Data Collection Rule)
+11. GuestAttestation     (CVM Data Collection Rule for attestation monitoring)
 12. Policy               (Require Guest Attestation policy definition) - optional
 ```
 
