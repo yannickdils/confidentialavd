@@ -7,16 +7,27 @@ pool:
 # ---------------------------------------------------------------------------
 # AVD-DeployAttestation pipeline
 #
-# Deploys and validates the Guest Attestation infrastructure for Confidential
-# AVD session hosts. Run this pipeline once per environment before deploying
-# your first CVM session hosts, or when adding attestation monitoring to an
-# existing Confidential AVD deployment.
+# Deploys and validates Guest Attestation monitoring infrastructure for
+# Confidential AVD session hosts.
+#
+# IMPORTANT: This pipeline does NOT deploy a custom Azure Attestation Provider.
+# The Microsoft.Attestation/attestationProviders resource type is not available
+# in Belgium Central. All session hosts use the Microsoft shared MAA endpoint:
+#
+#   West Europe  : https://sharedweu.weu.attest.azure.net
+#   North Europe : https://sharedneu.neu.attest.azure.net
+#
+# The shared endpoint provides identical cryptographic attestation guarantees
+# to a dedicated provider instance. No policy customisation is required for
+# Confidential AVD - the Microsoft baseline policy validates AMD SEV-SNP,
+# Secure Boot, and vTPM state out of the box.
 #
 # Stages:
 #   1. Approval gate  - human sign-off before any changes
-#   2. Deploy         - Attestation Provider + CVM-specific Data Collection Rule
-#   3. Validate       - checks GuestAttestation extension health on all CVMs
-#   4. Policy         - deploys the Azure Policy definition (optional)
+#   2. Deploy DCR     - CVM-specific Data Collection Rule for attestation events
+#   3. Deploy Policy  - Azure Policy definition (optional, can skip)
+#   4. Validate       - runs Get-AttestationStatus.ps1 against all CVMs
+#                       (extension check + JWT claims decode + RS256 sig verify)
 # ---------------------------------------------------------------------------
 
 parameters:
@@ -37,38 +48,48 @@ parameters:
 
   - name: subscriptionName
     type: string
-    displayName: "Azure subscription name or ID"
     default: '<SUBSCRIPTION_NAME>'
+    displayName: "Azure subscription name or ID"
 
   - name: resourceGroup
     type: string
-    displayName: "Resource group for attestation infrastructure"
     default: 'rg-avd-attest-prd-weu-001'
+    displayName: "Resource group for attestation monitoring infrastructure (DCR, Policy)"
 
   - name: hostsResourceGroup
     type: string
-    displayName: "Resource group containing session host VMs"
     default: 'rg-avd-prd-hosts'
+    displayName: "Resource group containing session host VMs"
 
   - name: hostPoolName
     type: string
-    displayName: "AVD host pool name (for validation output)"
     default: 'hp-avd-prd-weu-001'
+    displayName: "AVD host pool name (for validation output)"
 
   - name: location
     type: string
-    displayName: "Azure region"
     default: 'westeurope'
+    displayName: "Azure region for DCR deployment"
+
+  - name: maaEndpoint
+    type: string
+    default: 'https://sharedweu.weu.attest.azure.net'
+    displayName: "Microsoft shared MAA endpoint for JWT signature verification"
 
   - name: deployPolicy
     type: boolean
-    displayName: "Deploy Azure Policy definition for Guest Attestation"
     default: true
+    displayName: "Deploy Azure Policy definition for Guest Attestation enforcement"
+
+  - name: skipJwtValidation
+    type: boolean
+    default: false
+    displayName: "Skip JWT claims decode and signature verification in validate stage"
 
   - name: deploymentIdentifier
     type: string
     default: "deployment"
-    displayName: "Unique deployment identifier"
+    displayName: "Unique deployment identifier (namespaces pipeline stages)"
 
 stages:
   # ---------------------------------------------------------------------------
@@ -87,15 +108,15 @@ stages:
                 - checkout: self
 
   # ---------------------------------------------------------------------------
-  # Deploy Attestation Provider and Data Collection Rule
+  # Deploy CVM Data Collection Rule
   # ---------------------------------------------------------------------------
-  - stage: DeployAttestation_${{ parameters.deploymentIdentifier }}
-    displayName: "Deploy Attestation Infrastructure"
+  - stage: DeployDCR_${{ parameters.deploymentIdentifier }}
+    displayName: "Deploy CVM Data Collection Rule"
     dependsOn: approvalGate_${{ parameters.deploymentIdentifier }}
     condition: succeeded('approvalGate_${{ parameters.deploymentIdentifier }}')
     jobs:
-      - job: Deploy
-        displayName: "Deploy Attestation Provider and DCR"
+      - job: DeployDCR
+        displayName: "Deploy DCR for attestation and CVM monitoring"
         steps:
           - checkout: self
 
@@ -113,12 +134,16 @@ stages:
                   az group create `
                     --name "${{ parameters.resourceGroup }}" `
                     --location "${{ parameters.location }}"
+                  if ($LASTEXITCODE -ne 0) {
+                    Write-Host "##vso[task.logissue type=error]Failed to create resource group."
+                    exit 1
+                  }
                 } else {
                   Write-Host "Resource group ${{ parameters.resourceGroup }} already exists."
                 }
 
           - task: AzureCLI@2
-            displayName: "What-If: Attestation Provider"
+            displayName: "What-If: CVM Data Collection Rule"
             inputs:
               azureSubscription: "${{ parameters.serviceConnection }}"
               scriptType: "ps"
@@ -127,44 +152,14 @@ stages:
                 az account set --subscription "${{ parameters.subscriptionName }}"
                 az deployment group what-if `
                   --resource-group "${{ parameters.resourceGroup }}" `
-                  --name "Attest-WhatIf-$(Build.BuildId)" `
-                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/attestation-provider.bicep" `
-                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/attestation-provider.parameters.json" `
+                  --name "DCR-WhatIf-$(Build.BuildId)" `
+                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/dcr-confidential-avd.bicep" `
+                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/dcr-confidential-avd.parameters.json" `
                   --no-prompt true
 
           - task: AzureCLI@2
-            displayName: "Deploy Attestation Provider"
-            inputs:
-              azureSubscription: "${{ parameters.serviceConnection }}"
-              scriptType: "ps"
-              scriptLocation: "inlineScript"
-              inlineScript: |
-                az account set --subscription "${{ parameters.subscriptionName }}"
-
-                $output = az deployment group create `
-                  --resource-group "${{ parameters.resourceGroup }}" `
-                  --name "Attest-$(Build.BuildId)" `
-                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/attestation-provider.bicep" `
-                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/attestation-provider.parameters.json" `
-                  --mode Incremental `
-                  --no-prompt true `
-                  -o json
-
-                if ($LASTEXITCODE -ne 0) {
-                  Write-Host "##vso[task.logissue type=error]Attestation Provider deployment failed."
-                  exit 1
-                }
-
-                $outputs = ($output | ConvertFrom-Json).properties.outputs
-                $attestUri = $outputs.attestationProviderUri.value
-
-                Write-Host "Attestation Provider URI: $attestUri"
-                Write-Host "##vso[task.setvariable variable=attestationProviderUri;isOutput=true]$attestUri"
-                Write-Host "##[section]Attestation Provider deployed."
-            name: attestDeploy
-
-          - task: AzureCLI@2
             displayName: "Deploy CVM Data Collection Rule"
+            name: dcrDeploy
             inputs:
               azureSubscription: "${{ parameters.serviceConnection }}"
               scriptType: "ps"
@@ -187,56 +182,25 @@ stages:
                 }
 
                 $dcrId = ($output | ConvertFrom-Json).properties.outputs.dataCollectionRuleId.value
-                Write-Host "DCR ID: $dcrId"
+                Write-Host "DCR Resource ID: $dcrId"
                 Write-Host "##vso[task.setvariable variable=dataCollectionRuleId;isOutput=true]$dcrId"
+                Write-Host ""
+                Write-Host "##[section]NEXT STEP: Update hostpool config"
+                Write-Host "Set dataCollectionRuleId in your hostpool JSON config to: $dcrId"
+                Write-Host "New session hosts deployed by AVD-DeployAdditionalHosts will"
+                Write-Host "automatically associate with this DCR."
                 Write-Host "##[section]CVM Data Collection Rule deployed."
-            name: dcrDeploy
-
-  # ---------------------------------------------------------------------------
-  # Validate attestation extension health on existing session hosts
-  # ---------------------------------------------------------------------------
-  - stage: Validate_${{ parameters.deploymentIdentifier }}
-    displayName: "Validate Guest Attestation Extension"
-    dependsOn: DeployAttestation_${{ parameters.deploymentIdentifier }}
-    condition: succeeded('DeployAttestation_${{ parameters.deploymentIdentifier }}')
-    jobs:
-      - job: Validate
-        displayName: "Check attestation extension on all CVMs"
-        steps:
-          - checkout: self
-
-          - task: AzureCLI@2
-            displayName: "Run Get-AttestationStatus.ps1"
-            inputs:
-              azureSubscription: "${{ parameters.serviceConnection }}"
-              scriptType: "ps"
-              scriptLocation: "inlineScript"
-              inlineScript: |
-                az account set --subscription "${{ parameters.subscriptionName }}"
-
-                $result = & "$(System.DefaultWorkingDirectory)/Scripts/Get-AttestationStatus.ps1" `
-                    -SubscriptionName "${{ parameters.subscriptionName }}" `
-                    -HostsResourceGroup "${{ parameters.hostsResourceGroup }}" `
-                    -HostPoolName "${{ parameters.hostPoolName }}"
-
-                if ($LASTEXITCODE -eq 1) {
-                  Write-Host "##vso[task.logissue type=error]One or more session hosts have failed attestation. See output above."
-                  exit 1
-                }
-                if ($LASTEXITCODE -eq 2) {
-                  Write-Host "##vso[task.logissue type=warning]Some extensions still provisioning. Re-run validation in a few minutes."
-                }
 
   # ---------------------------------------------------------------------------
   # Deploy Azure Policy definition (optional)
   # ---------------------------------------------------------------------------
   - stage: DeployPolicy_${{ parameters.deploymentIdentifier }}
     displayName: "Deploy Azure Policy for Guest Attestation"
-    dependsOn: DeployAttestation_${{ parameters.deploymentIdentifier }}
-    condition: and(succeeded('DeployAttestation_${{ parameters.deploymentIdentifier }}'), eq('${{ parameters.deployPolicy }}', 'true'))
+    dependsOn: approvalGate_${{ parameters.deploymentIdentifier }}
+    condition: and(succeeded('approvalGate_${{ parameters.deploymentIdentifier }}'), eq('${{ parameters.deployPolicy }}', 'true'))
     jobs:
       - job: Policy
-        displayName: "Deploy policy definition"
+        displayName: "Deploy Guest Attestation policy definition"
         steps:
           - checkout: self
 
@@ -263,7 +227,63 @@ stages:
 
                 Write-Host "##[section]Policy definition deployed."
                 Write-Host ""
-                Write-Host "NEXT STEP: Assign the policy to your AVD session host subscription or resource group."
+                Write-Host "NEXT STEP: Assign the policy in the Azure Portal."
                 Write-Host "Go to: Azure Portal > Policy > Assignments > Assign Policy"
                 Write-Host "Select: require-guest-attestation-confidential-avd"
                 Write-Host "Scope: subscription or resource group containing your CVM session hosts"
+                Write-Host "Effect: AuditIfNotExists (switch to Deny once all hosts are compliant)"
+
+  # ---------------------------------------------------------------------------
+  # Validate Guest Attestation across all CVM session hosts
+  # Runs after DCR and Policy stages complete (or are skipped).
+  # Performs three levels of validation:
+  #   1. GuestAttestation extension provisioning state (control plane)
+  #   2. JWT claims decode - validates sevsnpvm, azure-compliant-cvm, secureboot
+  #   3. RS256 signature verification against the Microsoft shared MAA certs
+  # ---------------------------------------------------------------------------
+  - stage: Validate_${{ parameters.deploymentIdentifier }}
+    displayName: "Validate Guest Attestation"
+    dependsOn:
+      - DeployDCR_${{ parameters.deploymentIdentifier }}
+      - DeployPolicy_${{ parameters.deploymentIdentifier }}
+    condition: |
+      and(
+        in(dependencies.DeployDCR_${{ parameters.deploymentIdentifier }}.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.DeployPolicy_${{ parameters.deploymentIdentifier }}.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+      )
+    jobs:
+      - job: Validate
+        displayName: "Run Get-AttestationStatus.ps1"
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Validate attestation on all CVM session hosts"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az account set --subscription "${{ parameters.subscriptionName }}"
+
+                $params = @{
+                  SubscriptionName   = "${{ parameters.subscriptionName }}"
+                  HostsResourceGroup = "${{ parameters.hostsResourceGroup }}"
+                  HostPoolName       = "${{ parameters.hostPoolName }}"
+                  MaaEndpoint        = "${{ parameters.maaEndpoint }}"
+                }
+
+                if ("${{ parameters.skipJwtValidation }}" -eq "true") {
+                  $params["SkipJwtValidation"] = $true
+                }
+
+                & "$(System.DefaultWorkingDirectory)/Scripts/Get-AttestationStatus.ps1" @params
+
+                if ($LASTEXITCODE -eq 1) {
+                  Write-Host "##vso[task.logissue type=error]Attestation validation FAILED. See output above."
+                  exit 1
+                }
+                if ($LASTEXITCODE -eq 2) {
+                  Write-Host "##vso[task.logissue type=warning]Some validations were inconclusive (VMs may be deallocated)."
+                  Write-Host "##vso[task.logissue type=warning]Re-run after starting all session hosts."
+                }

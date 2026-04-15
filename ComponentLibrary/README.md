@@ -86,6 +86,8 @@ Typical deployment order for Confidential VM image build and session host deploy
 8. EventGrid alert       (Key expiry alerting via Event Grid + Azure Monitor) - CMK only, optional
 9. KeyVault              (Secrets for admin credentials / domain join)
 10. SessionHost (CC)     (Confidential Compute session hosts)
+11. GuestAttestation     (Attestation Provider + CVM Data Collection Rule)
+12. Policy               (Require Guest Attestation policy definition) - optional
 ```
 
 ## 📚 Related Documentation
