@@ -1,9 +1,3 @@
-trigger:
-- none
-
-pool:
-  name: ${{ parameters.agentPool }}
-
 # ---------------------------------------------------------------------------
 # AVD-DeployAttestation pipeline
 #
@@ -14,21 +8,31 @@ pool:
 # The Microsoft.Attestation/attestationProviders resource type is not available
 # in Belgium Central. All session hosts use the Microsoft shared MAA endpoint:
 #
-#   West Europe  : https://sharedweu.weu.attest.azure.net
-#   North Europe : https://sharedneu.neu.attest.azure.net
+#   West Europe     : https://sharedweu.weu.attest.azure.net
+#   North Europe    : https://sharedneu.neu.attest.azure.net
+#   Belgium Central : https://sharedbec.bec.attest.azure.net
 #
 # The shared endpoint provides identical cryptographic attestation guarantees
 # to a dedicated provider instance. No policy customisation is required for
-# Confidential AVD - the Microsoft baseline policy validates AMD SEV-SNP,
+# Confidential AVD -- the Microsoft baseline policy validates AMD SEV-SNP,
 # Secure Boot, and vTPM state out of the box.
 #
 # Stages:
-#   1. Approval gate  - human sign-off before any changes
-#   2. Deploy DCR     - CVM-specific Data Collection Rule for attestation events
-#   3. Deploy Policy  - Azure Policy definition (optional, can skip)
-#   4. Validate       - runs Get-AttestationStatus.ps1 against all CVMs
-#                       (extension check + JWT claims decode + RS256 sig verify)
+#   1. InitializeParameters  -- load JSON config and emit pipeline variables
+#   2. Approval gate         -- human sign-off before any changes
+#   3. Deploy DCR            -- CVM-specific Data Collection Rule for attestation events
+#                               + Log Analytics solutions + DCR association
+#   4. Deploy Policy         -- Azure Policy definition + assignment (optional)
+#   5. Validate              -- runs Get-AttestationStatus.ps1 against all CVMs
+#                               (6-step: extension, instance view, MAA certs,
+#                                in-VM evidence, JWT sig verify, LA query)
 # ---------------------------------------------------------------------------
+
+trigger:
+- none
+
+pool:
+  name: ${{ parameters.agentPool }}
 
 parameters:
   - name: agentPool
@@ -46,35 +50,10 @@ parameters:
     default: '<APPROVAL_ENVIRONMENT_NAME>'
     displayName: "Azure DevOps approval environment name"
 
-  - name: subscriptionName
+  - name: jsonFilePath
     type: string
-    default: '<SUBSCRIPTION_NAME>'
-    displayName: "Azure subscription name or ID"
-
-  - name: resourceGroup
-    type: string
-    default: 'rg-avd-attest-prd-weu-001'
-    displayName: "Resource group for attestation monitoring infrastructure (DCR, Policy)"
-
-  - name: hostsResourceGroup
-    type: string
-    default: 'rg-avd-prd-hosts'
-    displayName: "Resource group containing session host VMs"
-
-  - name: hostPoolName
-    type: string
-    default: 'hp-avd-prd-weu-001'
-    displayName: "AVD host pool name (for validation output)"
-
-  - name: location
-    type: string
-    default: 'westeurope'
-    displayName: "Azure region for DCR deployment"
-
-  - name: maaEndpoint
-    type: string
-    default: 'https://sharedweu.weu.attest.azure.net'
-    displayName: "Microsoft shared MAA endpoint for JWT signature verification"
+    default: 'Environments/Hostpools/hostpool.template.json'
+    displayName: "Path to JSON configuration file"
 
   - name: deployPolicy
     type: boolean
@@ -88,15 +67,113 @@ parameters:
 
   - name: deploymentIdentifier
     type: string
-    default: "deployment"
+    default: "default"
     displayName: "Unique deployment identifier (namespaces pipeline stages)"
 
 stages:
+  # ---------------------------------------------------------------------------
+  # Initialize Parameters -- load JSON config
+  # ---------------------------------------------------------------------------
+  - stage: InitializeParameters_${{ parameters.deploymentIdentifier }}
+    displayName: "Initialize Parameters"
+    jobs:
+      - job: LoadParameters
+        steps:
+          - task: PowerShell@2
+            displayName: "Load parameters from JSON file"
+            name: setVariables
+            inputs:
+              targetType: "inline"
+              script: |
+                try {
+                  $jsonFilePath = "$env:jsonFilePath"
+                  Write-Host "Loading JSON File: '$jsonFilePath'"
+
+                  if ([string]::IsNullOrEmpty($jsonFilePath)) {
+                    Write-Host "##vso[task.logissue type=error]Parameter 'jsonFilePath' is required but was not provided."
+                    exit 1
+                  } elseif (Test-Path $jsonFilePath) {
+                    $jsonParams = Get-Content $jsonFilePath | ConvertFrom-Json
+                    Write-Host "Loaded JSON file successfully."
+
+                    # Validate Confidential Compute is enabled
+                    $confidentialCompute = if ($jsonParams.confidentialCompute -eq $true) { 'true' } else { 'false' }
+                    if ($confidentialCompute -ne 'true') {
+                      Write-Host "##vso[task.logissue type=warning]confidentialCompute is not enabled in this hostpool config. Attestation pipeline is only relevant for Confidential VMs."
+                    }
+
+                    # Validate required parameters for attestation
+                    $requiredParams = @("subscriptionName", "hostPoolName", "hostsResourceGroup", "logAnalyticsWorkspaceName", "logAnalyticsResourceGroup")
+                    foreach ($param in $requiredParams) {
+                      if (-not (Get-Member -InputObject $jsonParams -Name $param -MemberType Properties) -or [string]::IsNullOrWhiteSpace($jsonParams.$param)) {
+                        Write-Host "##vso[task.logissue type=error]Required parameter '$param' missing or empty in JSON file."
+                        exit 1
+                      }
+                    }
+
+                    Write-Host "##vso[task.setvariable variable=subscriptionName;isOutput=true]$($jsonParams.subscriptionName)"
+                    Write-Host "##vso[task.setvariable variable=location;isOutput=true]$($jsonParams.location)"
+                    Write-Host "##vso[task.setvariable variable=hostPoolName;isOutput=true]$($jsonParams.hostPoolName)"
+                    Write-Host "##vso[task.setvariable variable=hostsResourceGroup;isOutput=true]$($jsonParams.hostsResourceGroup)"
+                    Write-Host "##vso[task.setvariable variable=hostPoolResourceGroup;isOutput=true]$($jsonParams.hostPoolResourceGroup)"
+
+                    Write-Host "##vso[task.setvariable variable=logAnalyticsWorkspaceName;isOutput=true]$($jsonParams.logAnalyticsWorkspaceName)"
+                    Write-Host "##vso[task.setvariable variable=logAnalyticsResourceGroup;isOutput=true]$($jsonParams.logAnalyticsResourceGroup)"
+
+                    # Log Analytics Workspace ID -- build from components if not provided directly
+                    $logAnalyticsWorkspaceId = $jsonParams.logAnalyticsWorkspaceId
+                    if ([string]::IsNullOrWhiteSpace($logAnalyticsWorkspaceId)) {
+                      # Extract subscription ID from subnetId (reliable, always populated)
+                      $subId = ($jsonParams.subnetId -split '/')[2]
+                      if ($subId -and $jsonParams.logAnalyticsResourceGroup -and $jsonParams.logAnalyticsWorkspaceName) {
+                        $logAnalyticsWorkspaceId = "/subscriptions/$subId/resourceGroups/$($jsonParams.logAnalyticsResourceGroup)/providers/Microsoft.OperationalInsights/workspaces/$($jsonParams.logAnalyticsWorkspaceName)"
+                        Write-Host "Built Log Analytics Workspace ID from components: $logAnalyticsWorkspaceId"
+                      }
+                    }
+                    Write-Host "##vso[task.setvariable variable=logAnalyticsWorkspaceId;isOutput=true]$logAnalyticsWorkspaceId"
+
+                    # Attestation URL -- default to West Europe shared MAA
+                    $attestationUrl = if ($jsonParams.attestationUrl) { $jsonParams.attestationUrl } else { 'https://sharedweu.weu.attest.azure.net' }
+                    Write-Host "##vso[task.setvariable variable=attestationUrl;isOutput=true]$attestationUrl"
+
+                    Write-Host "##vso[task.setvariable variable=confidentialCompute;isOutput=true]$confidentialCompute"
+
+                  } else {
+                    Write-Host "##vso[task.logissue type=error]JSON file not found at '$jsonFilePath'."
+                    exit 1
+                  }
+                } catch {
+                  Write-Host "##vso[task.logissue type=error]Error reading JSON file or setting parameters: $($_.Exception.Message)"
+                  exit 1
+                }
+            env:
+              jsonFilePath: ${{ parameters.jsonFilePath }}
+
+          - task: PowerShell@2
+            displayName: "Display loaded variables"
+            inputs:
+              targetType: "inline"
+              script: |
+                Write-Host "=============== ATTESTATION PIPELINE VARIABLES ==============="
+                Write-Host "Subscription    : $(setVariables.subscriptionName)"
+                Write-Host "Location        : $(setVariables.location)"
+                Write-Host "Host Pool       : $(setVariables.hostPoolName)"
+                Write-Host "Hosts RG        : $(setVariables.hostsResourceGroup)"
+                Write-Host "Host Pool RG    : $(setVariables.hostPoolResourceGroup)"
+                Write-Host "LA Workspace    : $(setVariables.logAnalyticsWorkspaceName)"
+                Write-Host "LA RG           : $(setVariables.logAnalyticsResourceGroup)"
+                Write-Host "Attestation URL : $(setVariables.attestationUrl)"
+                Write-Host "Conf. Compute   : $(setVariables.confidentialCompute)"
+                Write-Host "Deploy Policy   : ${{ parameters.deployPolicy }}"
+                Write-Host "Skip JWT        : ${{ parameters.skipJwtValidation }}"
+
   # ---------------------------------------------------------------------------
   # Approval gate
   # ---------------------------------------------------------------------------
   - stage: approvalGate_${{ parameters.deploymentIdentifier }}
     displayName: "Approval Gate"
+    dependsOn: InitializeParameters_${{ parameters.deploymentIdentifier }}
+    condition: succeeded('InitializeParameters_${{ parameters.deploymentIdentifier }}')
     jobs:
       - deployment: attestationDeployment
         displayName: "Approval Gate for Attestation Deployment"
@@ -112,35 +189,22 @@ stages:
   # ---------------------------------------------------------------------------
   - stage: DeployDCR_${{ parameters.deploymentIdentifier }}
     displayName: "Deploy CVM Data Collection Rule"
-    dependsOn: approvalGate_${{ parameters.deploymentIdentifier }}
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - approvalGate_${{ parameters.deploymentIdentifier }}
     condition: succeeded('approvalGate_${{ parameters.deploymentIdentifier }}')
+    variables:
+      subscriptionName: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionName'] ]
+      location: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.location'] ]
+      hostPoolResourceGroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostPoolResourceGroup'] ]
+      hostsResourceGroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostsResourceGroup'] ]
+      logAnalyticsWorkspaceName: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.logAnalyticsWorkspaceName'] ]
+      logAnalyticsResourceGroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.logAnalyticsResourceGroup'] ]
     jobs:
       - job: DeployDCR
         displayName: "Deploy DCR for attestation and CVM monitoring"
         steps:
           - checkout: self
-
-          - task: AzureCLI@2
-            displayName: "Ensure Resource Group Exists"
-            inputs:
-              azureSubscription: "${{ parameters.serviceConnection }}"
-              scriptType: "ps"
-              scriptLocation: "inlineScript"
-              inlineScript: |
-                az account set --subscription "${{ parameters.subscriptionName }}"
-                $rg = az group show --name "${{ parameters.resourceGroup }}" --query "name" -o tsv 2>$null
-                if (-not $rg) {
-                  Write-Host "Creating resource group ${{ parameters.resourceGroup }}"
-                  az group create `
-                    --name "${{ parameters.resourceGroup }}" `
-                    --location "${{ parameters.location }}"
-                  if ($LASTEXITCODE -ne 0) {
-                    Write-Host "##vso[task.logissue type=error]Failed to create resource group."
-                    exit 1
-                  }
-                } else {
-                  Write-Host "Resource group ${{ parameters.resourceGroup }} already exists."
-                }
 
           - task: AzureCLI@2
             displayName: "What-If: CVM Data Collection Rule"
@@ -149,13 +213,139 @@ stages:
               scriptType: "ps"
               scriptLocation: "inlineScript"
               inlineScript: |
-                az account set --subscription "${{ parameters.subscriptionName }}"
+                $subscriptionName = "$(subscriptionName)"
+                if ([string]::IsNullOrWhiteSpace($subscriptionName)) {
+                  Write-Host "##vso[task.logissue type=error]subscriptionName is EMPTY."
+                  exit 1
+                }
+
+                az account set --subscription "$subscriptionName"
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to set subscription."
+                  exit 1
+                }
+
+                # Build Log Analytics Workspace resource ID
+                $laName = "$(logAnalyticsWorkspaceName)"
+                $laRg   = "$(logAnalyticsResourceGroup)"
+                $subId  = (az account show --query id -o tsv)
+                $laId   = "/subscriptions/$subId/resourceGroups/$laRg/providers/Microsoft.OperationalInsights/workspaces/$laName"
+
+                # Build parameters file to avoid PS 5.1 double-quote stripping on native commands
+                $paramsObj = @{
+                  '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
+                  contentVersion = '1.0.0.0'
+                  parameters     = @{
+                    dataCollectionRuleName  = @{ value = "dcr-avd-confidential-$subscriptionName-001" }
+                    logAnalyticsWorkspaceId = @{ value = $laId }
+                    tags                    = @{ value = @{
+                      environment = 'prd'
+                      component   = 'monitoring'
+                      purpose     = 'confidential-avd-attestation-monitoring'
+                    }}
+                  }
+                }
+                $paramsFile = Join-Path $env:TEMP "dcr-whatif-params.json"
+                $paramsObj | ConvertTo-Json -Depth 5 | Set-Content -Path $paramsFile -Encoding UTF8
+
                 az deployment group what-if `
-                  --resource-group "${{ parameters.resourceGroup }}" `
-                  --name "DCR-WhatIf-$(Build.BuildId)" `
-                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/dcr-confidential-avd.bicep" `
-                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/dcr-confidential-avd.parameters.json" `
+                  --resource-group "$(hostPoolResourceGroup)" `
+                  --name "Dpl-$(subscriptionName)-DCR-WhatIf-$(Build.BuildId)" `
+                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/main.bicep" `
+                  --parameters $paramsFile `
                   --no-prompt true
+
+          # SecurityEvent and WindowsEvent are solution-managed tables.
+          # They are created by deploying Log Analytics solutions via Bicep
+          # (ComponentLibrary/GuestAttestation/solutions.bicep).
+          # This uses ARM deployment (not az rest) so errors are always visible.
+          - task: AzureCLI@2
+            displayName: "Ensure Log Analytics solutions & tables"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $subscriptionName = "$(subscriptionName)"
+                az account set --subscription "$subscriptionName"
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to set subscription."
+                  exit 1
+                }
+
+                $laName   = "$(logAnalyticsWorkspaceName)"
+                $laRg     = "$(logAnalyticsResourceGroup)"
+                $subId    = (az account show --query id -o tsv)
+                $wsId     = "/subscriptions/$subId/resourceGroups/$laRg/providers/Microsoft.OperationalInsights/workspaces/$laName"
+
+                # Build parameters file with tags
+                $paramsObj = @{
+                  '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
+                  contentVersion = '1.0.0.0'
+                  parameters     = @{
+                    workspaceName       = @{ value = $laName }
+                    workspaceResourceId = @{ value = $wsId }
+                    tags                = @{ value = @{
+                      environment = 'prd'
+                      component   = 'monitoring'
+                      purpose     = 'confidential-avd-attestation-monitoring'
+                    }}
+                  }
+                }
+                $paramsFile = Join-Path $env:TEMP "solutions-deploy-params.json"
+                $paramsObj | ConvertTo-Json -Depth 5 | Set-Content -Path $paramsFile -Encoding UTF8
+
+                Write-Host "=== Deploying Log Analytics solutions via Bicep ==="
+                Write-Host "  Target RG: $laRg"
+                Write-Host "  Workspace: $laName"
+
+                az deployment group create `
+                  --resource-group "$laRg" `
+                  --name "Dpl-$($subscriptionName)-LASolutions-$(Build.BuildId)" `
+                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/solutions.bicep" `
+                  --parameters $paramsFile `
+                  --mode Incremental `
+                  --no-prompt true `
+                  -o json
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host ""
+                  Write-Host "##vso[task.logissue type=error]Solution deployment failed. See ARM error above."
+                  Write-Host "The SPN may need 'Log Analytics Contributor' on RG '$laRg'."
+                  Write-Host "Or install solutions manually: Portal > Log Analytics workspace '$laName' > Legacy solutions"
+                  exit 1
+                }
+
+                Write-Host ""
+                Write-Host "=== Solutions deployed. Waiting for tables to provision ==="
+                $requiredTables = @('SecurityEvent', 'WindowsEvent')
+                $maxRetries = 12   # 12 x 15s = 3 minutes
+                $retryDelay = 15
+
+                for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+                  $stillMissing = @()
+                  foreach ($table in $requiredTables) {
+                    $tableUrl = "https://management.azure.com/subscriptions/$subId/resourceGroups/$laRg/providers/Microsoft.OperationalInsights/workspaces/$laName/tables/${table}?api-version=2022-10-01"
+                    $ErrorActionPreference = 'SilentlyContinue'
+                    $null = az rest --method GET --url $tableUrl 2>$null
+                    $ec = $LASTEXITCODE
+                    $ErrorActionPreference = 'Stop'
+                    if ($ec -ne 0) { $stillMissing += $table }
+                  }
+
+                  if ($stillMissing.Count -eq 0) {
+                    Write-Host "  [OK] All required tables are available (attempt $attempt)."
+                    exit 0
+                  }
+
+                  Write-Host "  Attempt $attempt/$maxRetries -- missing: $($stillMissing -join ', '). Waiting ${retryDelay}s..."
+                  Start-Sleep -Seconds $retryDelay
+                }
+
+                Write-Host ""
+                Write-Host "##vso[task.logissue type=error]Tables did not appear within $($maxRetries * $retryDelay)s."
+                Write-Host "Solutions deployed successfully but tables are still provisioning. Re-run the pipeline."
+                exit 1
 
           - task: AzureCLI@2
             displayName: "Deploy CVM Data Collection Rule"
@@ -165,13 +355,46 @@ stages:
               scriptType: "ps"
               scriptLocation: "inlineScript"
               inlineScript: |
-                az account set --subscription "${{ parameters.subscriptionName }}"
+                $subscriptionName = "$(subscriptionName)"
+                if ([string]::IsNullOrWhiteSpace($subscriptionName)) {
+                  Write-Host "##vso[task.logissue type=error]subscriptionName is EMPTY."
+                  exit 1
+                }
+
+                az account set --subscription "$subscriptionName"
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to set subscription."
+                  exit 1
+                }
+
+                # Build Log Analytics Workspace resource ID
+                $laName = "$(logAnalyticsWorkspaceName)"
+                $laRg   = "$(logAnalyticsResourceGroup)"
+                $subId  = (az account show --query id -o tsv)
+                $laId   = "/subscriptions/$subId/resourceGroups/$laRg/providers/Microsoft.OperationalInsights/workspaces/$laName"
+
+                # Build parameters file to avoid PS 5.1 double-quote stripping on native commands
+                $paramsObj = @{
+                  '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
+                  contentVersion = '1.0.0.0'
+                  parameters     = @{
+                    dataCollectionRuleName  = @{ value = "dcr-avd-confidential-$subscriptionName-001" }
+                    logAnalyticsWorkspaceId = @{ value = $laId }
+                    tags                    = @{ value = @{
+                      environment = 'prd'
+                      component   = 'monitoring'
+                      purpose     = 'confidential-avd-attestation-monitoring'
+                    }}
+                  }
+                }
+                $paramsFile = Join-Path $env:TEMP "dcr-deploy-params.json"
+                $paramsObj | ConvertTo-Json -Depth 5 | Set-Content -Path $paramsFile -Encoding UTF8
 
                 $output = az deployment group create `
-                  --resource-group "${{ parameters.resourceGroup }}" `
-                  --name "DCR-$(Build.BuildId)" `
-                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/dcr-confidential-avd.bicep" `
-                  --parameters "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/dcr-confidential-avd.parameters.json" `
+                  --resource-group "$(hostPoolResourceGroup)" `
+                  --name "Dpl-$(subscriptionName)-DCR-$(Build.BuildId)" `
+                  --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/GuestAttestation/main.bicep" `
+                  --parameters $paramsFile `
                   --mode Incremental `
                   --no-prompt true `
                   -o json
@@ -184,23 +407,117 @@ stages:
                 $dcrId = ($output | ConvertFrom-Json).properties.outputs.dataCollectionRuleId.value
                 Write-Host "DCR Resource ID: $dcrId"
                 Write-Host "##vso[task.setvariable variable=dataCollectionRuleId;isOutput=true]$dcrId"
-                Write-Host ""
-                Write-Host "##[section]NEXT STEP: Update hostpool config"
-                Write-Host "Set dataCollectionRuleId in your hostpool JSON config to: $dcrId"
-                Write-Host "New session hosts deployed by AVD-DeployAdditionalHosts will"
-                Write-Host "automatically associate with this DCR."
                 Write-Host "##[section]CVM Data Collection Rule deployed."
 
+          - task: AzureCLI@2
+            displayName: "Associate DCR to existing CVM session hosts"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $subscriptionName = "$(subscriptionName)"
+                az account set --subscription "$subscriptionName"
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to set subscription."
+                  exit 1
+                }
+
+                $dcrId = "$(dcrDeploy.dataCollectionRuleId)"
+                if ([string]::IsNullOrWhiteSpace($dcrId)) {
+                  Write-Host "##vso[task.logissue type=error]dataCollectionRuleId is empty -- DCR deployment may have failed."
+                  exit 1
+                }
+
+                $resourceGroups = @("$(hostsResourceGroup)")
+
+                $totalAssociated = 0
+                $totalSkipped    = 0
+                $totalFailed     = 0
+
+                foreach ($rg in $resourceGroups) {
+                  Write-Host ""
+                  Write-Host "##[section]Processing resource group: $rg"
+
+                  $ErrorActionPreference = 'SilentlyContinue'
+                  $vmsJson = az vm list --resource-group $rg --query "[?securityProfile.securityType=='ConfidentialVM']" -o json 2>$null
+                  $vmListEc = $LASTEXITCODE
+                  $ErrorActionPreference = 'Stop'
+                  if ($vmListEc -ne 0) {
+                    Write-Host "##vso[task.logissue type=warning]Failed to list VMs in '$rg' -- resource group may not exist yet."
+                    continue
+                  }
+
+                  $vms = $vmsJson | ConvertFrom-Json
+                  if ($vms.Count -eq 0) {
+                    Write-Host "  No Confidential VMs found in '$rg' -- skipping."
+                    continue
+                  }
+
+                  Write-Host "  Found $($vms.Count) CVM(s) in '$rg'"
+
+                  foreach ($vm in $vms) {
+                    $vmName = $vm.name
+                    $assocName = "configurationAccessEndpoint"
+
+                    # Check if association already exists
+                    $ErrorActionPreference = 'SilentlyContinue'
+                    $existing = az monitor data-collection rule association list --resource "$($vm.id)" --query "[?name=='$assocName']" -o json 2>$null
+                    $assocListEc = $LASTEXITCODE
+                    $ErrorActionPreference = 'Stop'
+                    if ($assocListEc -eq 0) {
+                      $existingParsed = $existing | ConvertFrom-Json
+                      if ($existingParsed.Count -gt 0 -and $existingParsed[0].dataCollectionRuleId -eq $dcrId) {
+                        Write-Host "  [SKIP] $vmName -- already associated with this DCR"
+                        $totalSkipped++
+                        continue
+                      }
+                    }
+
+                    Write-Host "  [ASSOC] $vmName -- creating DCR association..."
+                    $ErrorActionPreference = 'SilentlyContinue'
+                    az monitor data-collection rule association create `
+                      --name $assocName `
+                      --rule-id $dcrId `
+                      --resource "$($vm.id)" 2>$null | Out-Null
+                    $assocCreateEc = $LASTEXITCODE
+                    $ErrorActionPreference = 'Stop'
+
+                    if ($assocCreateEc -ne 0) {
+                      Write-Host "##vso[task.logissue type=warning]Failed to associate DCR to $vmName"
+                      $totalFailed++
+                    } else {
+                      Write-Host "  [OK]    $vmName -- DCR associated"
+                      $totalAssociated++
+                    }
+                  }
+                }
+
+                Write-Host ""
+                Write-Host "##[section]DCR Association Summary"
+                Write-Host "  Associated : $totalAssociated"
+                Write-Host "  Skipped    : $totalSkipped (already associated)"
+                Write-Host "  Failed     : $totalFailed"
+
+                if ($totalFailed -gt 0) {
+                  Write-Host "##vso[task.logissue type=warning]$totalFailed VM(s) failed DCR association -- check warnings above."
+                }
+
   # ---------------------------------------------------------------------------
-  # Deploy Azure Policy definition (optional)
+  # Deploy Azure Policy definition + assignment (optional)
   # ---------------------------------------------------------------------------
   - stage: DeployPolicy_${{ parameters.deploymentIdentifier }}
     displayName: "Deploy Azure Policy for Guest Attestation"
-    dependsOn: approvalGate_${{ parameters.deploymentIdentifier }}
+    dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
+      - approvalGate_${{ parameters.deploymentIdentifier }}
     condition: and(succeeded('approvalGate_${{ parameters.deploymentIdentifier }}'), eq('${{ parameters.deployPolicy }}', 'true'))
+    variables:
+      subscriptionName: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionName'] ]
+      hostPoolResourceGroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostPoolResourceGroup'] ]
     jobs:
       - job: Policy
-        displayName: "Deploy Guest Attestation policy definition"
+        displayName: "Deploy Guest Attestation policy definition and assignment"
         steps:
           - checkout: self
 
@@ -211,13 +528,22 @@ stages:
               scriptType: "ps"
               scriptLocation: "inlineScript"
               inlineScript: |
-                az account set --subscription "${{ parameters.subscriptionName }}"
+                $subscriptionName = "$(subscriptionName)"
+                if ([string]::IsNullOrWhiteSpace($subscriptionName)) {
+                  Write-Host "##vso[task.logissue type=error]subscriptionName is EMPTY."
+                  exit 1
+                }
 
-                az deployment group create `
-                  --resource-group "${{ parameters.resourceGroup }}" `
-                  --name "Policy-$(Build.BuildId)" `
+                az account set --subscription "$subscriptionName"
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to set subscription."
+                  exit 1
+                }
+
+                az deployment sub create `
+                  --location "westeurope" `
+                  --name "Dpl-$(subscriptionName)-Policy-$(Build.BuildId)" `
                   --template-file "$(System.DefaultWorkingDirectory)/ComponentLibrary/Policy/policy-require-guest-attestation.bicep" `
-                  --mode Incremental `
                   --no-prompt true
 
                 if ($LASTEXITCODE -ne 0) {
@@ -226,24 +552,79 @@ stages:
                 }
 
                 Write-Host "##[section]Policy definition deployed."
+
+          - task: AzureCLI@2
+            displayName: "Assign policy in AuditIfNotExists mode"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $subscriptionName = "$(subscriptionName)"
+                az account set --subscription "$subscriptionName"
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to set subscription."
+                  exit 1
+                }
+
+                $subId = (az account show --query id -o tsv)
+                $scope = "/subscriptions/$subId"
+                $policyName = "require-guest-attestation-confidential-avd"
+                $assignmentName = "assign-guest-attestation-$subscriptionName"
+
+                # Check if assignment already exists
+                try {
+                  $ErrorActionPreference = 'SilentlyContinue'
+                  $existing = az policy assignment show --name $assignmentName --scope $scope 2>$null
+                  $ErrorActionPreference = 'Stop'
+                  if ($LASTEXITCODE -eq 0) {
+                    Write-Host "Policy assignment '$assignmentName' already exists -- updating."
+                  }
+                } catch {
+                  $ErrorActionPreference = 'Stop'
+                  Write-Host "Policy assignment '$assignmentName' does not exist yet -- creating."
+                }
+
+                # Write effect params to temp file to avoid PS 5.1 double-quote stripping
+                $effectFile = Join-Path $env:TEMP "policy-effect-params.json"
+                '{"effect":{"value":"AuditIfNotExists"}}' | Set-Content -Path $effectFile -Encoding UTF8
+
+                az policy assignment create `
+                  --name $assignmentName `
+                  --display-name "Audit: Require Guest Attestation on Confidential AVD VMs ($subscriptionName)" `
+                  --policy $policyName `
+                  --scope $scope `
+                  --params "@$effectFile" `
+                  --enforcement-mode Default
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Policy assignment failed."
+                  exit 1
+                }
+
+                Write-Host "##[section]Policy assigned in AuditIfNotExists mode."
+                Write-Host "  Assignment : $assignmentName"
+                Write-Host "  Scope      : $scope"
+                Write-Host "  Effect     : AuditIfNotExists"
                 Write-Host ""
-                Write-Host "NEXT STEP: Assign the policy in the Azure Portal."
-                Write-Host "Go to: Azure Portal > Policy > Assignments > Assign Policy"
-                Write-Host "Select: require-guest-attestation-confidential-avd"
-                Write-Host "Scope: subscription or resource group containing your CVM session hosts"
-                Write-Host "Effect: AuditIfNotExists (switch to Deny once all hosts are compliant)"
+                Write-Host "To switch to Deny mode once all hosts are compliant:"
+                Write-Host "  az policy assignment update --name $assignmentName --scope $scope --params '{\"effect\":{\"value\":\"Deny\"}}'"
 
   # ---------------------------------------------------------------------------
   # Validate Guest Attestation across all CVM session hosts
   # Runs after DCR and Policy stages complete (or are skipped).
-  # Performs three levels of validation:
+  # Performs six levels of validation:
   #   1. GuestAttestation extension provisioning state (control plane)
-  #   2. JWT claims decode - validates sevsnpvm, azure-compliant-cvm, secureboot
-  #   3. RS256 signature verification against the Microsoft shared MAA certs
+  #   2. Detailed attestation status via instance view (control plane)
+  #   3. MAA signing certificate chain analysis (all X.509 certs)
+  #   4. In-VM evidence collection (Secure Boot, TPM, VBS, THIM, IMDS)
+  #   5. JWT token decode and RS256 signature verification against MAA certs
+  #   6. Log Analytics attestation event query
   # ---------------------------------------------------------------------------
   - stage: Validate_${{ parameters.deploymentIdentifier }}
     displayName: "Validate Guest Attestation"
     dependsOn:
+      - InitializeParameters_${{ parameters.deploymentIdentifier }}
       - DeployDCR_${{ parameters.deploymentIdentifier }}
       - DeployPolicy_${{ parameters.deploymentIdentifier }}
     condition: |
@@ -251,6 +632,12 @@ stages:
         in(dependencies.DeployDCR_${{ parameters.deploymentIdentifier }}.result, 'Succeeded', 'SucceededWithIssues'),
         in(dependencies.DeployPolicy_${{ parameters.deploymentIdentifier }}.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
       )
+    variables:
+      subscriptionName: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.subscriptionName'] ]
+      hostsResourceGroup: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostsResourceGroup'] ]
+      hostPoolName: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.hostPoolName'] ]
+      attestationUrl: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.attestationUrl'] ]
+      logAnalyticsWorkspaceId: $[ stageDependencies.InitializeParameters_${{ parameters.deploymentIdentifier }}.LoadParameters.outputs['setVariables.logAnalyticsWorkspaceId'] ]
     jobs:
       - job: Validate
         displayName: "Run Get-AttestationStatus.ps1"
@@ -258,19 +645,35 @@ stages:
           - checkout: self
 
           - task: AzureCLI@2
-            displayName: "Validate attestation on all CVM session hosts"
+            displayName: "Validate attestation"
             inputs:
               azureSubscription: "${{ parameters.serviceConnection }}"
               scriptType: "ps"
               scriptLocation: "inlineScript"
               inlineScript: |
-                az account set --subscription "${{ parameters.subscriptionName }}"
+                $subscriptionName = "$(subscriptionName)"
+                if ([string]::IsNullOrWhiteSpace($subscriptionName)) {
+                  Write-Host "##vso[task.logissue type=error]subscriptionName is EMPTY."
+                  exit 1
+                }
 
+                az account set --subscription "$subscriptionName"
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "##vso[task.logissue type=error]Failed to set subscription."
+                  exit 1
+                }
+
+                Write-Host "##[section]Validating hosts: $(hostsResourceGroup)"
                 $params = @{
-                  SubscriptionName   = "${{ parameters.subscriptionName }}"
-                  HostsResourceGroup = "${{ parameters.hostsResourceGroup }}"
-                  HostPoolName       = "${{ parameters.hostPoolName }}"
-                  MaaEndpoint        = "${{ parameters.maaEndpoint }}"
+                  SubscriptionName   = "$(subscriptionName)"
+                  HostsResourceGroup = "$(hostsResourceGroup)"
+                  HostPoolName       = "$(hostPoolName)"
+                  MaaEndpoint        = "$(attestationUrl)"
+                }
+
+                $laWorkspaceId = "$(logAnalyticsWorkspaceId)"
+                if (-not [string]::IsNullOrWhiteSpace($laWorkspaceId)) {
+                  $params["LogAnalyticsWorkspaceId"] = $laWorkspaceId
                 }
 
                 if ("${{ parameters.skipJwtValidation }}" -eq "true") {
@@ -285,5 +688,5 @@ stages:
                 }
                 if ($LASTEXITCODE -eq 2) {
                   Write-Host "##vso[task.logissue type=warning]Some validations were inconclusive (VMs may be deallocated)."
-                  Write-Host "##vso[task.logissue type=warning]Re-run after starting all session hosts."
                 }
+                exit 0

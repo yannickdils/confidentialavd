@@ -1,15 +1,3 @@
-@description('Name of the Data Collection Rule.')
-param dataCollectionRuleName string
-
-@description('Azure region for the DCR.')
-param location string = resourceGroup().location
-
-@description('Resource ID of the Log Analytics Workspace to send data to.')
-param logAnalyticsWorkspaceId string
-
-@description('Tags to apply to all resources.')
-param tags object
-
 // ---------------------------------------------------------------------------
 // Data Collection Rule for Confidential AVD monitoring
 //
@@ -31,6 +19,19 @@ param tags object
 // The DCR is associated to each session host via the dcrAssociation resource
 // in avd-sessionhosts-cc.bicep (the dataCollectionRuleId param).
 // ---------------------------------------------------------------------------
+
+@description('Name of the Data Collection Rule.')
+param dataCollectionRuleName string
+
+@description('Azure region for the DCR.')
+param location string = resourceGroup().location
+
+@description('Resource ID of the Log Analytics Workspace to send data to.')
+param logAnalyticsWorkspaceId string
+
+@description('Tags to apply to all resources.')
+param tags object
+
 resource dcr 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
   name: dataCollectionRuleName
   location: location

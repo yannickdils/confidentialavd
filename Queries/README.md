@@ -22,7 +22,7 @@ A collection of 8 saved queries designed to be used in your Log Analytics worksp
 ## Prerequisites
 
 - The GuestAttestation extension must be installed on all CVM session hosts
-- The DCR from `ComponentLibrary/GuestAttestation/dcr-confidential-avd.bicep` must be associated to all session hosts
+- The DCR from `ComponentLibrary/GuestAttestation/main.bicep` must be associated to all session hosts
 - The AzureMonitorWindowsAgent extension must be collecting data
 - For query 8: Azure Policy diagnostic logs must be routed to the same Log Analytics Workspace
 
@@ -37,6 +37,6 @@ A collection of 8 saved queries designed to be used in your Log Analytics worksp
 
 | File | Purpose |
 |------|---------|
-| [`ComponentLibrary/GuestAttestation/dcr-confidential-avd.bicep`](../ComponentLibrary/GuestAttestation/dcr-confidential-avd.bicep) | DCR that collects the data these queries operate on |
+| [`ComponentLibrary/GuestAttestation/main.bicep`](../ComponentLibrary/GuestAttestation/main.bicep) | DCR that collects the data these queries operate on |
 | [`Scripts/Get-AttestationStatus.ps1`](../Scripts/Get-AttestationStatus.ps1) | Script-based attestation health check (alternative to KQL) |
 | [`ComponentLibrary/Policy/policy-require-guest-attestation.bicep`](../ComponentLibrary/Policy/policy-require-guest-attestation.bicep) | Policy definition that query 8 monitors |
