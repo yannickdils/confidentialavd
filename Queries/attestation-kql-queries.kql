@@ -6,7 +6,7 @@
 //
 // All queries assume:
 //   - The GuestAttestation extension is installed on all CVM session hosts
-//   - The DCR from dcr-confidential-avd.bicep is associated to all session hosts
+//   - The DCR from ComponentLibrary/GuestAttestation/main.bicep is associated to all session hosts
 //   - The AzureMonitorWindowsAgent extension is collecting data
 // =============================================================================
 

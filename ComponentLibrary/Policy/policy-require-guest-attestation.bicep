@@ -1,14 +1,5 @@
-@description('Name for the policy definition.')
-param policyDefinitionName string = 'require-guest-attestation-confidential-avd'
-
-@description('Display name shown in the Azure Portal.')
-param policyDisplayName string = 'Require Guest Attestation extension on Confidential AVD session hosts'
-
-@description('Description shown in the Azure Portal.')
-param policyDescription string = 'Ensures that all Confidential VM session hosts in Azure Virtual Desktop have the GuestAttestation extension installed and healthy. Without this extension, there is no cryptographic proof that the session host is running in a genuine AMD SEV-SNP Trusted Execution Environment.'
-
 // ---------------------------------------------------------------------------
-// Policy Definition
+// Azure Policy Definition: Require Guest Attestation on Confidential AVD VMs
 //
 // Effect: AuditIfNotExists
 // This audits (rather than denies) VMs that are missing or have a failed
@@ -18,6 +9,21 @@ param policyDescription string = 'Ensures that all Confidential VM session hosts
 // Scope this assignment to:
 //   - The subscription or resource group containing your AVD session hosts
 //   - NOT the image build subscription (those VMs are Trusted Launch, not CVM)
+// ---------------------------------------------------------------------------
+
+@description('Name for the policy definition.')
+param policyDefinitionName string = 'require-guest-attestation-confidential-avd'
+
+@description('Display name shown in the Azure Portal.')
+param policyDisplayName string = 'Require Guest Attestation extension on Confidential AVD session hosts'
+
+@description('Description shown in the Azure Portal.')
+param policyDescription string = 'Ensures that all Confidential VM session hosts in Azure Virtual Desktop have the GuestAttestation extension installed and healthy. Without this extension, there is no cryptographic proof that the session host is running in a genuine AMD SEV-SNP Trusted Execution Environment.'
+
+targetScope = 'subscription'
+
+// ---------------------------------------------------------------------------
+// Policy Definition
 // ---------------------------------------------------------------------------
 resource policyDef 'Microsoft.Authorization/policyDefinitions@2023-04-01' = {
   name: policyDefinitionName

@@ -9,10 +9,11 @@ Bicep modules for deploying **Guest Attestation monitoring** infrastructure for 
 | Resource | Description |
 |----------|-------------|
 | **Data Collection Rule** | CVM-specific DCR that collects attestation events, security events, and performance counters |
+| **Log Analytics Solutions** | Security and SecurityInsights solutions that provision the required tables |
 
 ## Modules
 
-### `dcr-confidential-avd.bicep`
+### `main.bicep`
 
 Deploys a Data Collection Rule that collects three categories of data the standard AVD Insights DCR does not cover:
 
@@ -43,15 +44,16 @@ Use **`Pipelines/AVD-DeployAttestation.yml`** which deploys the DCR, validates G
 ```bash
 az deployment group create \
   --resource-group rg-avd-attest-prd-weu-001 \
-  --template-file ComponentLibrary/GuestAttestation/dcr-confidential-avd.bicep \
-  --parameters @ComponentLibrary/GuestAttestation/dcr-confidential-avd.parameters.json
+  --template-file ComponentLibrary/GuestAttestation/main.bicep \
+  --parameters @ComponentLibrary/GuestAttestation/main.parameters.json
 ```
 
 ## Related Files
 
 | File | Purpose |
 |------|---------|
-| [`dcr-confidential-avd.parameters.json`](dcr-confidential-avd.parameters.json) | Example parameter file for the DCR |
+| [`main.parameters.json`](main.parameters.json) | Example parameter file for the DCR |
+| [`solutions.bicep`](solutions.bicep) | Log Analytics solutions that provision SecurityEvent and WindowsEvent tables |
 | [`Policy/policy-require-guest-attestation.bicep`](../Policy/policy-require-guest-attestation.bicep) | Azure Policy to audit VMs missing the GuestAttestation extension |
 | [`Scripts/Get-AttestationStatus.ps1`](../../Scripts/Get-AttestationStatus.ps1) | Script to check attestation health across all session hosts |
 | [`Queries/attestation-kql-queries.kql`](../../Queries/attestation-kql-queries.kql) | KQL queries for monitoring attestation events in Log Analytics |
