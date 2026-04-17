@@ -60,9 +60,16 @@ confidentialavd/
 ├── Queries/
 │   └── attestation-kql-queries.kql      # KQL queries for attestation monitoring
 │
+├── Operations/                          # Day-two operational playbooks (part 4)
+│   ├── monthly-patch-cycle.md           # Four-week cadence aligned with Patch Tuesday
+│   ├── runbooks.md                      # Tier 1-4 incident runbooks
+│   ├── operational-maturity-checklist.md # Self-assessment: Deployed → Resilient
+│   └── figure1-operations.png           # Series diagram
+│
 └── Scripts/
     ├── CreateHSM_CMK.ps1                # Create Managed HSM key for CVM encryption
     ├── Rotate-CMK.ps1                   # Safely rotate CMK key (drain, deallocate, rotate, restart)
+    ├── Invoke-SafeCMKRotation.ps1       # Autoscale-aware wrapper around Rotate-CMK.ps1
     ├── Get-AttestationStatus.ps1        # Check GuestAttestation extension health on all CVMs
     ├── Get-AIBPackerLog.ps1             # Retrieve AIB Packer build logs
     ├── Register-CCFeatureFlags.ps1      # Register CC feature flags
@@ -129,6 +136,16 @@ Use pipeline: **AVD-DeployAttestation.yml** - this pipeline has four stages:
 
 Run this pipeline once per environment before deploying your first CVM session hosts, or when adding attestation monitoring to an existing Confidential AVD deployment. See `ComponentLibrary/GuestAttestation/`, `ComponentLibrary/Policy/`, and `Queries/attestation-kql-queries.kql` for the underlying modules and monitoring queries.
 
+### Step 6 - Operate the platform (day two)
+
+Once parts 1 to 3 are deployed, the platform moves from a project into day-two operations. The [`Operations/`](Operations/README.md) folder holds the playbooks that make Confidential AVD actually runnable in production:
+
+- **`monthly-patch-cycle.md`** - four-week cadence aligned with Patch Tuesday (review → build → test → rollout) that keeps Guest Attestation healthy through Windows updates and AIB image refreshes.
+- **`runbooks.md`** - four severity tiers (Minor attestation failure → Moderate zone capacity exhaustion → Major HSM key expiry → Severe regional outage), each with trigger, RTO, recovery steps, and verification criteria.
+- **`operational-maturity-checklist.md`** - honest self-assessment across four tiers (Deployed / Monitored / Operable / Resilient) with binary per-item criteria.
+
+The runbooks reference [`Scripts/Invoke-SafeCMKRotation.ps1`](Scripts/Invoke-SafeCMKRotation.ps1), which wraps the nine-step `Rotate-CMK.ps1` rotation from part 2 with the AVD autoscale exclusion-tag guard so the two do not race during maintenance windows.
+
 ## ⚠️ Prerequisites
 
 ### For both PMK and CMK
@@ -147,7 +164,10 @@ Run this pipeline once per environment before deploying your first CVM session h
 
 ## 📚 References
 
-- [📝 Blog: How to build and deploy confidential AVD images with Azure Image Builder](https://www.tunecom.be/how-to-build-confidential-avd-images-with-azure-image-builder/) - Full walkthrough, architecture decisions, and gotchas
+- [📝 Blog part 1: How to build and deploy confidential AVD images with Azure Image Builder](https://www.tunecom.be/how-to-build-confidential-avd-images-with-azure-image-builder/)
+- [📝 Blog part 2: Customer-Managed Keys for Confidential AVD](https://www.tunecom.be/customer-managed-keys-confidential-avd/)
+- [📝 Blog part 3: Guest Attestation for Confidential AVD](https://www.tunecom.be/guest-attestation-confidential-avd/)
+- [📝 Blog part 4: Operating Confidential AVD at Scale](https://www.tunecom.be/operating-confidential-avd-at-scale/)
 - [Azure Confidential VMs](https://learn.microsoft.com/en-us/azure/confidential-computing/confidential-vm-overview)
 - [Azure Image Builder](https://learn.microsoft.com/en-us/azure/virtual-machines/image-builder-overview)
 - [Disk Encryption with Confidential VMs](https://learn.microsoft.com/en-us/azure/confidential-computing/confidential-vm-disk-encryption)

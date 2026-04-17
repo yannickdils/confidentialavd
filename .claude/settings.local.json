@@ -5,7 +5,13 @@
       "Bash(gh pr:*)",
       "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" pr list --head features/blogattestationfix --repo yannickdils/confidentialavd --state all)",
       "Bash(where gh:*)",
-      "Bash(powershell -Command \"Get-Command gh -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")"
+      "Bash(powershell -Command \"Get-Command gh -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")",
+      "Bash(cp \"C:/Temp/Blog4/Invoke-SafeCMKRotation.ps1\" \"C:/Repos/confidentialavd/Scripts/Invoke-SafeCMKRotation.ps1\")",
+      "Bash(cp \"C:/Temp/Blog4/zone-aware-sessionhost.bicep\" \"C:/Repos/confidentialavd/ComponentLibrary/AzureVirtualDesktop/SessionHost/zone-aware-sessionhost.bicep\")",
+      "Bash(cp \"C:/Temp/Blog4/monthly-patch-cycle.md\" \"C:/Repos/confidentialavd/Operations/monthly-patch-cycle.md\")",
+      "Bash(cp \"C:/Temp/Blog4/operational-maturity-checklist.md\" \"C:/Repos/confidentialavd/Operations/operational-maturity-checklist.md\")",
+      "Bash(cp \"C:/Temp/Blog4/runbooks.md\" \"C:/Repos/confidentialavd/Operations/runbooks.md\")",
+      "mcp__192f3e55-2e4b-4528-9b61-cb1cde921a35__generate-design"
     ]
   }
 }
