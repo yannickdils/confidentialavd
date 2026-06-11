@@ -8,6 +8,7 @@ PowerShell scripts for managing Confidential AVD infrastructure, key operations,
 |--------|---------|
 | [`CreateHSM_CMK.ps1`](CreateHSM_CMK.ps1) | Create a Managed HSM key with Secure Key Release (SKR) policy for CVM disk encryption |
 | [`Rotate-CMK.ps1`](Rotate-CMK.ps1) | Safely rotate a CMK key: drain session hosts, deallocate, rotate, restart |
+| [`Invoke-SafeCMKRotation.ps1`](Invoke-SafeCMKRotation.ps1) | Wraps `Rotate-CMK.ps1` with the AVD autoscale exclusion-tag guard so rotations do not race with ramp-down (part 4) |
 | [`Get-AttestationStatus.ps1`](Get-AttestationStatus.ps1) | Query and report GuestAttestation extension health across all CVM session hosts |
 | [`Get-AIBPackerLog.ps1`](Get-AIBPackerLog.ps1) | Retrieve Azure Image Builder Packer build logs for troubleshooting |
 | [`Watch-AIBBuild.ps1`](Watch-AIBBuild.ps1) | Monitor Azure Image Builder build progress in real time |
@@ -37,6 +38,22 @@ Use `Rotate-CMK.ps1` to safely rotate a CMK key. CVM does not support automatic 
 
 ```powershell
 .\Rotate-CMK.ps1 -HsmName "kvhsmmgmthubabc001" -KeyName "cmk-avd-prd-weu-001"
+```
+
+### Rotating safely alongside AVD autoscale
+
+Use `Invoke-SafeCMKRotation.ps1` when autoscale is attached to the host pool. The wrapper refuses to run with active user sessions, tags every CVM with the scaling plan's exclusion tag so autoscale leaves them alone during the rotation, invokes `Rotate-CMK.ps1`, and removes the tag once the rotation completes. See [`Operations/monthly-patch-cycle.md`](../Operations/monthly-patch-cycle.md) for the recommended scheduling window.
+
+```powershell
+.\Invoke-SafeCMKRotation.ps1 `
+    -SubscriptionName "sub-avd-prd" `
+    -HostsResourceGroup "rg-avd-prd-hosts" `
+    -HostPoolName "hp-avd-prd-weu-001" `
+    -ScalingPlanName "sp-avd-prd-weu-001" `
+    -ScalingPlanResourceGroup "rg-avd-prd-mgmt" `
+    -KeyVaultName "hsm-avd-prd-weu-001" `
+    -KeyName "cmk-avd-prd" `
+    -DiskEncryptionSetName "des-avd-prd-weu-001"
 ```
 
 ## Attestation Health
